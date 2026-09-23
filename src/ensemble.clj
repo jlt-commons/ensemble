@@ -31,6 +31,7 @@
 (def ! act/!)
 (def !! act/!!)
 (def receive-match act/receive-match)
+(def receive-timed act/receive-timed)
 (def self act/self)
 (def join act/join)
 (def state act/state)
@@ -39,6 +40,11 @@
 (def register! act/register!)
 (def whereis act/whereis)
 (def unregister! act/unregister!)
+(def vref act/vref)
+(def maketag act/maketag)
+(def mailbox-of act/mailbox-of)
+(def watch! act/watch!)
+(def unwatch! act/unwatch!)
 
 (defmacro receive
   "Selective receive over the current actor's mailbox.  See ensemble.actor."
@@ -49,8 +55,11 @@
 
 (def gen-server gs/gen-server)
 (def reply! gs/reply!)
+(def reply-error! gs/reply-error!)
 (def call! gs/call!)
+(def call-timed! gs/call-timed!)
 (def cast! gs/cast!)
+(def shutdown! gs/shutdown!)
 
 ;; gen_event ------------------------------------------------------------
 
@@ -72,6 +81,9 @@
 (def start-supervisor sup/start-supervisor)
 (def start-child! sup/start-child!)
 (def terminate-child! sup/terminate-child!)
+(def get-child sup/get-child)
+(def remove-child! sup/remove-child!)
+(def remove-and-terminate-child! sup/remove-and-terminate-child!)
 (def which-children! sup/which-children!)
 
 ;; behaviours (implement these on a record) -----------------------------

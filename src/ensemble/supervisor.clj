@@ -67,9 +67,16 @@
 (defn- drop-child [st id]
   (update st :children (fn [cs] (filterv (fn [c] (not= (:id c) id)) cs))))
 
-(defrecord Supervisor [strategy max-restarts max-seconds]
+(defrecord Supervisor [strategy max-restarts max-seconds initial]
   gs/Server
-  (init [_] {:children [] :restarts []})
+  (init [_]
+    {:restarts []
+     :children (mapv (fn [spec]
+                       (start-and-register (act/self)
+                                           {:id (:id spec)
+                                            :spec spec
+                                            :restart (:restart spec :permanent)}))
+                     initial)})
   (handle-call [_ _from msg st]
     (case (first msg)
       :start-child
@@ -80,6 +87,16 @@
         [:reply (:id child) (update st :children conj child)])
       :terminate-child
       [:reply :ok (drop-child st (nth msg 1))]
+      :remove-child
+      [:reply :ok (drop-child st (nth msg 1))]
+      :remove-and-terminate-child
+      (let [id (nth msg 1)
+            c (first (filter (fn [x] (= (:id x) id)) (:children st)))]
+        (when-let [a (:actor c)] (act/! a [:ensemble/shutdown :shutdown]))
+        [:reply :ok (drop-child st id)])
+      :get-child
+      (let [c (first (filter (fn [x] (= (:id x) (nth msg 1))) (:children st)))]
+        [:reply (:actor c) st])
       :which-children
       [:reply (mapv :id (:children st)) st]))
   (handle-cast [_ _msg st] [:noreply st])
@@ -105,10 +122,16 @@
   (terminate [_ _reason _st] nil))
 
 (defn start-supervisor
+  "Start a supervisor.  Options:
+
+      :strategy      :one-for-one | :one-for-all | :rest-for-one
+      :max-restarts  restarts allowed within :max-seconds before shutdown
+      :max-seconds   the window :max-restarts is counted over
+      :children      a seq of child specs to start before the supervisor runs"
   ([] (start-supervisor {}))
-  ([{:keys [strategy max-restarts max-seconds]
+  ([{:keys [strategy max-restarts max-seconds children]
      :or   {strategy :one-for-one max-restarts 3 max-seconds 5}}]
-   (gs/gen-server (->Supervisor strategy max-restarts max-seconds))))
+   (gs/gen-server (->Supervisor strategy max-restarts max-seconds children))))
 
 (defn start-child!
   "Start a child from spec under sup.  Returns the child id."
@@ -117,6 +140,23 @@
 
 (defn terminate-child! [sup id]
   (gs/call! sup [:terminate-child id]))
+
+(defn get-child
+  "The live child actor registered under id, or nil."
+  [sup id]
+  (gs/call! sup [:get-child id]))
+
+(defn remove-child!
+  "Stop tracking the child under id, leaving its actor running."
+  [sup id]
+  (gs/call! sup [:remove-child id]))
+
+(defn remove-and-terminate-child!
+  "Stop tracking the child under id and best-effort stop it.  Jolt fibers cannot
+  be cancelled, so the supervisor sends the child a shutdown message (which a
+  gen-server child honours) and otherwise just untracks it."
+  [sup id]
+  (gs/call! sup [:remove-and-terminate-child id]))
 
 (defn which-children!
   "The ids of the supervisor's live children, in start order."

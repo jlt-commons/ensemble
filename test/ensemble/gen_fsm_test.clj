@@ -41,3 +41,25 @@
     (is (= :open (fsm/sync-send-event! f :open)))
     (fsm/send-event! f :quit)
     (is (= :requested (act/join f)))))
+
+(deftest bare-send-drives-the-fsm
+  (let [f (fsm/start-fsm (->Turnstile))]
+    (act/! f :coin)
+    (is (= :unlocked (fsm/sync-send-event! f :query)))))
+
+(defrecord Replier []
+  fsm/FSM
+  (fsm-init [_] [:idle [:init]])
+  (fsm-handle-event [_ nm event data]
+    (case event
+      :peek-async [:reply :ignored :from-async (conj data :touched)]
+      :where [:reply nm nm data]
+      :get-data [:reply data nm data]))
+  (fsm-handle-timeout [_ nm data] [:next nm data])
+  (fsm-terminate [_ _reason _nm _data] nil))
+
+(deftest async-reply-updates-name-and-data
+  (let [f (fsm/start-fsm (->Replier))]
+    (fsm/send-event! f :peek-async)
+    (is (= :from-async (fsm/sync-send-event! f :where)))
+    (is (= [:init :touched] (fsm/sync-send-event! f :get-data)))))

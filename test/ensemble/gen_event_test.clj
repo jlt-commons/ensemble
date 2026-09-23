@@ -54,3 +54,10 @@
     (ev/add-handler! m :a (->Sink l))
     (ev/sync-notify! m :hello)
     (is (= :hello (ev/call-handler! m :a [:last])))))
+
+(deftest init-time-handler-registration
+  (let [l (atom [])
+        m (ev/start-manager {:handlers [[:a (->Sink l)]]})]
+    (ev/sync-notify! m :boot)
+    (is (= [:boot] @l))
+    (is (= 1 (ev/call-handler! m :a [:count])))))

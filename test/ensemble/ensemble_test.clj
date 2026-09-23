@@ -48,3 +48,22 @@
     (is (= [:c] (e/which-children! sup)))
     (e/terminate-child! sup :c)
     (is (= [] (e/which-children! sup)))))
+
+(deftest new-gen-server-api-through-the-umbrella
+  (let [s (e/gen-server (->Counter))]
+    (is (= 3 (e/call-timed! s 500 [:add 3])))
+    (is (= 3 (e/call-timed! s 500 [:get])))
+    (e/shutdown! s)
+    (is (nil? (e/join s)))))
+
+(deftest watch-through-the-umbrella
+  (let [dead (e/spawn (fn [] :ok))
+        w (e/spawn (fn [] (e/watch! dead) (e/receive [[:exit _ a c] [a c]])))]
+    (is (= [dead nil] (e/join w)))))
+
+(deftest child-ops-through-the-umbrella
+  (let [sup (e/start-supervisor {})]
+    (e/start-child! sup :c {:start (fn [] (e/gen-server (->Counter)))})
+    (is (some? (e/get-child sup :c)))
+    (e/remove-child! sup :c)
+    (is (= [] (e/which-children! sup)))))

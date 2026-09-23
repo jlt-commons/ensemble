@@ -14,7 +14,11 @@
        :doorbell atom a channel the receiving fiber parks on
        :state   atom  the actor's current state
        :done    promise  [:ok v] or [:err e] once the body returns
-       :name    the registered name, or nil}
+       :name    the registered name, or nil
+       ::actor  true     marks the map as an actor}
+
+  ::actor is what actor? checks, so a plain map that happens to carry a
+  :mailbox key is not mistaken for an actor.
 
   Spawning runs the body on a fiber with *actor* bound, so the body can call
   self, receive and ! as the actor."
@@ -34,20 +38,74 @@
 
 (defonce ^:private registry (atom {}))
 
+(declare ^:private drop-watches-of!)
+(declare ^:private notify-watchers!)
+
+(defn- actor? [x]
+  (and (map? x) (contains? x ::actor)))
+
+(defn- norm-name
+  "A registry key from a name.  Accepts a string, keyword or symbol; anything
+  else is a caller error, so throw rather than store under a nonsense key."
+  [nm]
+  (if (or (string? nm) (keyword? nm) (symbol? nm))
+    (clojure.core/name nm)
+    (throw (ex-info "name must be a string, keyword or symbol" {:name nm}))))
+
+(defn vref
+  "Wrap a value in an IDeref so it can be deref'd."
+  [x]
+  (reify clojure.lang.IDeref (deref [_] x)))
+
+(defn maketag
+  "A random, probably-unique identifier (Erlang's makeref)."
+  []
+  (rand-int 1000000000))
+
 (defn register!
-  "Publish actor under name so whereis finds it."
-  [name actor]
-  (swap! registry assoc name actor)
-  actor)
+  "Publish an actor so whereis finds it.  The name may be a string or keyword;
+  both normalise to the same string key.  Arities mirror pulsar: (register!
+  nm actor) registers a specific actor, (register! nm) registers the current
+  actor, (register! actor) registers that actor under its own :name, and
+  (register!) registers the current actor under its :name."
+  ([nm actor]
+   (swap! registry assoc (norm-name nm) actor)
+   actor)
+  ([actor-or-name]
+   (if (actor? actor-or-name)
+     (let [nm (:name actor-or-name)]
+       (when nm (swap! registry assoc (norm-name nm) actor-or-name))
+       actor-or-name)
+     (register! actor-or-name (self))))
+  ([]
+   (register! (:name (self)) (self))))
 
 (defn whereis
-  "The actor registered under name, or nil."
-  [name]
-  (get @registry name))
+  "The actor registered under nm, or nil.  With a timeout in milliseconds,
+  poll until it appears or the timeout elapses (returns nil on timeout)."
+  ([nm]
+   (get @registry (norm-name nm)))
+  ([nm timeout-ms]
+   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+     (loop []
+       (or (get @registry (norm-name nm))
+           (when (< (System/currentTimeMillis) deadline)
+             (a/<!! (a/timeout 5))
+             (recur)))))))
 
-(defn unregister! [name]
-  (swap! registry dissoc name)
-  nil)
+(defn unregister!
+  "Remove an actor from the registry.  Accepts the actor itself or a name;
+  with no argument, unregisters the current actor."
+  ([x]
+   (swap! registry dissoc (norm-name (if (actor? x) (:name x) x)))
+   nil)
+  ([]
+   (unregister! (self))))
+
+(defn mailbox-of
+  "The mailbox of actor."
+  [actor]
+  (:mailbox actor))
 
 (defn- new-doorbell [] (atom (a/chan (a/dropping-buffer 1))))
 
@@ -55,7 +113,7 @@
 
 (defn- actor-obj [fiber mailbox doorbell state done name]
   {:fiber fiber :mailbox mailbox :doorbell doorbell
-   :state state :done done :name name})
+   :state state :done done :name name ::actor true})
 
 (defn spawn
   "Start an actor running f on a fiber.  f is called with no arguments and its
@@ -75,27 +133,36 @@
          fiber (fib/spawn
                 (fn []
                   (binding [*actor* @me]
-                    (let [r (try {:ok (f)} (catch Throwable e {:err e}))]
-                      (if (contains? r :ok)
-                        (do (deliver done [:ok (:ok r)]) (:ok r))
-                        (do (deliver done [:err (:err r)]) (throw (:err r))))))))
+                    (let [r (try {:ok (f)} (catch Throwable e {:err e}))
+                          ok? (contains? r :ok)]
+                      (drop-watches-of! @me)
+                      (deliver done (if ok? [:ok (:ok r)] [:err (:err r)]))
+                      (notify-watchers! @me (when-not ok? (:err r)))
+                      (if ok? (:ok r) (throw (:err r)))))))
          actor (actor-obj fiber mbox bell st done (:name opts))]
      (deliver me actor)
      (when (:name opts) (register! (:name opts) actor))
      actor)))
 
-(defn !
-  "Send msg to actor.  Returns actor.  Never blocks the sender."
-  [actor msg]
+(defn- send! [actor msg]
   (swap! (:mailbox actor) mb/enqueue msg)
   (signal! actor)
   actor)
 
+(defn !
+  "Send msg to actor.  Returns actor.  Never blocks the sender.
+
+  With more than one message argument they are packed into a vector, matching
+  pulsar: (! a 1 2) sends [1 2]."
+  ([actor msg] (send! actor msg))
+  ([actor arg & args] (send! actor (into [arg] args))))
+
 (defn !!
-  "Synchronous send: like ! but counts as delivered once queued.  Same as ! for
-  an unbounded mailbox."
-  [actor msg]
-  (! actor msg))
+  "Synchronous send.  Identical to ! here: a send is a completed swap! before it
+  returns, so there is no weaker guarantee to strengthen.  Kept for parity with
+  pulsar's sendSync.  Packs multiple arguments into a vector like !."
+  ([actor msg] (send! actor msg))
+  ([actor arg & args] (send! actor (into [arg] args))))
 
 (defn- claim-of
   "Atomically take the first message matching one of pats out of the mailbox.
@@ -112,20 +179,28 @@
     @taken))
 
 (defn receive-match
-  "Block until a mailbox message matches one of pats.  Returns [pat-idx env]
-  with env the captured bindings, or [:timeout {}] when timeout-ms elapses
-  first.  With timeout-ms nil it waits forever."
+  "Block until a mailbox message matches one of pats.  Returns [pat-idx msg env]
+  with msg the message and env the captured bindings, or [:timeout {}] when
+  timeout-ms elapses first.  With timeout-ms nil it waits forever."
   [actor pats timeout-ms]
   (loop []
     (if-let [t (claim-of (:mailbox actor) pats)]
       (let [idx (nth t 0)
             msg (nth t 1)]
-        [idx (match/capture (nth pats idx) msg)])
+        [idx msg (match/capture (nth pats idx) msg)])
       (let [bell @(:doorbell actor)]
         (if (some? timeout-ms)
           (let [[v _] (a/alts!! [bell (a/timeout timeout-ms)])]
             (if (nil? v) [:timeout {}] (recur)))
           (do (a/<!! bell) (recur)))))))
+
+(defn receive-timed
+  "Wait up to timeout-ms for the next message and return it, or nil if none
+  arrives.  Takes the message whatever it is, without matching."
+  [timeout-ms]
+  (let [r (receive-match (self) [[:Wild]] timeout-ms)]
+    (when-not (= :timeout (nth r 0))
+      (nth r 1))))
 
 (defn- emit-body [pat body]
   (let [syms (pattern/bound-syms pat)]
@@ -160,7 +235,7 @@
        (cond
          (nil? ~'r) nil
          (= :timeout (nth ~'r 0)) ~(if after (emit-body '_ (:body after)) nil)
-         :else (let [~'env (nth ~'r 1)]
+         :else (let [~'env (nth ~'r 2)]
                  (case (nth ~'r 0)
                    ~@(mapcat (fn [i c] [i (emit-body (:pattern c) (:body c))])
                              (range) ms)
@@ -183,7 +258,71 @@
     (or (= :done s) (= :dead s))))
 
 (defn join
-  "Block until the actor settles; return its value, or rethrow what it threw."
-  [actor]
+  "Block until the actor settles; return its value, or rethrow what it threw.
+  With a timeout in milliseconds, throw if the actor has not settled by then."
+  ([actor]
+   (let [[tag v] @(:done actor)]
+     (if (= :ok tag) v (throw v))))
+  ([actor timeout-ms]
+   (let [c (a/chan 1)]
+     (fib/spawn (fn [] (a/>!! c @(:done actor))))
+     (let [[r _] (a/alts!! [c (a/timeout timeout-ms)])]
+       (if (nil? r)
+         (throw (ex-info "join timed out" {:timeout-ms timeout-ms}))
+         (let [[tag v] r]
+           (if (= :ok tag) v (throw v))))))))
+
+(defonce ^:private watches (atom {}))
+
+(defn- settled? [actor]
+  (realized? (:done actor)))
+
+(defn- done-cause [actor]
   (let [[tag v] @(:done actor)]
-    (if (= :ok tag) v (throw v))))
+    (when (= :err tag) v)))
+
+(defn- claim-watch!
+  "Atomically take ref out of the watch table, returning true only for the
+  caller that removed it, so two racers never both notify."
+  [ref]
+  (let [prev (volatile! nil)]
+    (swap! watches (fn [ws] (vreset! prev ws) (dissoc ws ref)))
+    (contains? @prev ref)))
+
+(defn- notify-watchers!
+  "Tell everyone watching actor that it settled.  A racing watch! claims the
+  same ref with the same atomic dissoc, so at most one of the two notifies."
+  [actor cause]
+  (doseq [[ref w] @watches
+          :when (= (:watched w) actor)]
+    (when (claim-watch! ref)
+      (! (:watcher w) [:exit ref actor cause]))))
+
+(defn- drop-watches-of!
+  "Forget every watch held by actor; it is settling and can no longer receive
+  them."
+  [actor]
+  (swap! watches
+         (fn [ws] (into {} (remove (fn [[_ w]] (= (:watcher w) actor)) ws)))))
+
+(defn watch!
+  "Watch actor from the current actor.  Returns a ref.  When actor settles the
+  watching actor receives [:exit ref actor cause], where cause is nil for a
+  normal exit and the throwable otherwise.  The watch is asymmetric: the
+  watcher is not affected by the watched actor's death, and watching an
+  already-dead actor still notifies.  No fiber is parked per watch: the watched
+  actor fans out on settle, and a dying watcher drops its own watches."
+  ([actor] (watch! (self) actor))
+  ([watcher actor]
+   (let [ref (gensym "watch")]
+     (swap! watches assoc ref {:watcher watcher :watched actor})
+     (when (settled? actor)
+       (when (claim-watch! ref)
+         (! watcher [:exit ref actor (done-cause actor)])))
+     ref)))
+
+(defn unwatch!
+  "Stop watching the actor identified by ref; no exit message is sent."
+  [ref]
+  (swap! watches dissoc ref)
+  nil)

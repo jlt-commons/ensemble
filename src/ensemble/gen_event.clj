@@ -31,9 +31,9 @@
   (doseq [h hs] (h-terminate (:handler h) reason (:st h)))
   hs)
 
-(defrecord Manager []
+(defrecord Manager [initial]
   gs/Server
-  (init [_] {:handlers []})
+  (init [_] {:handlers (mapv (fn [[id h]] {:id id :handler h :st (h-init h)}) initial)})
   (handle-call [_ _from msg st]
     (let [hs (:handlers st)]
       (case (first msg)
@@ -59,8 +59,11 @@
   (terminate [_ reason st] (terminate-all (:handlers st) reason)))
 
 (defn start-manager
+  "Create and start an event manager.  Options are gen-server options plus
+  :handlers, a seq of [id handler] pairs registered before the manager starts
+  handling events."
   ([] (start-manager {}))
-  ([opts] (gs/gen-server (->Manager) opts)))
+  ([opts] (gs/gen-server (->Manager (:handlers opts)) (dissoc opts :handlers))))
 
 (defn add-handler!
   "Add (or replace) the handler registered under id."

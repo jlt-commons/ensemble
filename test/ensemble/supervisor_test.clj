@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as a]
             [clojure.test :refer [deftest is]]
             [ensemble.actor :as act]
+            [ensemble.gen-server :as gs]
             [ensemble.supervisor :as sup]))
 
 (defn- eventually
@@ -105,3 +106,51 @@
     (is (= [:a] (sup/which-children! sup)))
     (sup/terminate-child! sup :a)
     (is (= [] (sup/which-children! sup)))))
+
+(defrecord Rester []
+  gs/Server
+  (init [_] nil)
+  (handle-call [_ _from _msg st] [:reply :ok st])
+  (handle-cast [_ _msg st] [:noreply st])
+  (handle-info [_ _msg st] [:noreply st])
+  (handle-timeout [_ st] [:noreply st])
+  (terminate [_ _reason _st] nil))
+
+(deftest get-child-returns-the-actor
+  (let [a (atom 0)
+        sup (sup/start-supervisor {})]
+    (sup/start-child! sup :a {:start (quiet a (atom nil))})
+    (is (some? (sup/get-child sup :a)))
+    (is (nil? (sup/get-child sup :missing)))))
+
+(deftest remove-child-untracks-without-stopping-it
+  (let [a (atom 0) kill (atom nil)
+        sup (sup/start-supervisor {})]
+    (sup/start-child! sup :a {:start (quiet a kill)})
+    (sup/remove-child! sup :a)
+    (is (= [] (sup/which-children! sup)))
+    (is (false? (act/done? @kill)))
+    (act/! @kill :bye)
+    (is (= :ok (act/join @kill)))))
+
+(deftest remove-and-terminate-child-stops-the-child
+  (let [sup (sup/start-supervisor {})]
+    (sup/start-child! sup :a {:start (fn [] (gs/gen-server (->Rester)))})
+    (let [child (sup/get-child sup :a)]
+      (sup/remove-and-terminate-child! sup :a)
+      (is (= [] (sup/which-children! sup)))
+      (is (eventually (fn [] (act/done? child)))))))
+
+(deftest init-time-children
+  (let [a (atom 0)
+        sup (sup/start-supervisor {:children [{:id :a :start (quiet a (atom nil))}]})]
+    (is (= [:a] (sup/which-children! sup)))
+    (is (= 1 @a))))
+
+(deftest permanent-child-restarts-on-normal-exit
+  (let [a (atom 0) kill (atom nil)
+        sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 5})]
+    (sup/start-child! sup :a {:start (quiet a kill) :restart :permanent})
+    (act/! @kill :bye)
+    (is (eventually (fn [] (= 2 @a))))
+    (is (= [:a] (sup/which-children! sup)))))

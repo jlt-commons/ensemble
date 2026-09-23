@@ -19,6 +19,16 @@
   (fsm-handle-timeout [this state-name data] "Return a tagged vector or same [name data].")
   (fsm-terminate [this reason state-name data] "Run once on :stop."))
 
+(defn- fsm-step
+  "Run fsm-handle-event and translate its tagged return into a gen-server
+  return for an asynchronous event (no caller to reply to)."
+  [fsm st event]
+  (let [r (fsm-handle-event fsm (:name st) event (:data st))]
+    (case (first r)
+      :next [:noreply {:name (nth r 1) :data (nth r 2)} (nth r 3 nil)]
+      :reply [:noreply {:name (nth r 2) :data (nth r 3)} (nth r 4 nil)]
+      :stop [:stop (nth r 1) {:name (nth r 2) :data (nth r 3)}])))
+
 (defrecord FsmServer [fsm]
   gs/Server
   (init [_]
@@ -30,13 +40,8 @@
         :next [:reply (nth r 1) {:name (nth r 1) :data (nth r 2)} (nth r 3 nil)]
         :reply [:reply (nth r 1) {:name (nth r 2) :data (nth r 3)} (nth r 4 nil)]
         :stop [:stop (nth r 1) {:name (nth r 2) :data (nth r 3)}])))
-  (handle-cast [_ msg st]
-    (let [r (fsm-handle-event fsm (:name st) (nth msg 1) (:data st))]
-      (case (first r)
-        :next [:noreply {:name (nth r 1) :data (nth r 2)} (nth r 3 nil)]
-        :reply [:noreply {:name (nth r 2) :data (nth r 3)} (nth r 4 nil)]
-        :stop [:stop (nth r 1) {:name (nth r 2) :data (nth r 3)}])))
-  (handle-info [_ _msg st] [:noreply st])
+  (handle-cast [_ msg st] (fsm-step fsm st (nth msg 1)))
+  (handle-info [_ msg st] (fsm-step fsm st msg))
   (handle-timeout [_ st]
     (let [r (fsm-handle-timeout fsm (:name st) (:data st))]
       (case (first r)

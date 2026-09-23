@@ -58,7 +58,16 @@ itself, or a vector to match a message element by element.
 ```
 
 `e/spawn` takes `{:name :state}` options and `e/whereis` looks up a registered
-name. `e/join` blocks until the actor settles and rethrows whatever it threw.
+name. `e/join` blocks until the actor settles and rethrows whatever it threw;
+`(e/join a timeout-ms)` throws if the actor has not settled in time.
+`e/receive-timed` waits for the next message of any shape and returns it, or nil
+on timeout. `!` and `!!` pack extra arguments into a vector: `(! a 1 2)` sends
+`[1 2]`.
+
+`e/watch!` makes one actor watch another. The watcher receives
+`[:exit ref actor cause]` when the watched actor settles — `cause` nil for a
+normal exit, the throwable otherwise — even if it was already dead when watched.
+`e/unwatch!` cancels a watch by the ref `watch!` returned.
 
 ## gen_server
 
@@ -88,7 +97,12 @@ milliseconds.
 ```
 
 `gen-server` takes an initial `:timeout` that arms `handle-timeout` before the
-first message arrives.
+first message arrives. `call!`, `call-timed!` and `cast!` pack extra arguments
+into a vector like `!`, and `call-timed!` overrides the call timeout per call. A
+message that is not tagged `[:call ...]`/`[:cast ...]`/`[:info ...]` goes to
+`handle-info` as-is. `reply!` from anywhere lets a handler answer a call later.
+If a handler throws, `call!` rethrows to the caller and the server terminates.
+`shutdown!` stops the server from outside as a normal exit.
 
 ## gen_event
 
@@ -105,7 +119,8 @@ implementing `Handler` with `h-init`, `h-handle-event`, `h-handle-call` and
 ```
 
 `notify` is async, `sync-notify!` waits for every handler to run, and
-`call-handler!` talks to one handler by id.
+`call-handler!` talks to one handler by id. Pass `:handlers` (a seq of
+`[id handler]`) to `start-manager` to register handlers before the manager runs.
 
 ## gen_fsm
 
@@ -130,6 +145,10 @@ A state machine with named states. `fsm-init` returns `[state-name data]`.
 (fsm/sync-send-event! t :coin) ;=> :unlocked
 ```
 
+Events arrive through `send-event!`/`sync-send-event!`, or a plain `!` to the fsm
+actor (the message is the event). `sync-send-event!` returns the `[:reply ...]`
+value.
+
 ## Supervisors
 
 A supervisor starts children from specs and restarts them when they exit. A spec
@@ -144,19 +163,53 @@ optional `:restart` type.
 
 (sup/start-child! sup :db {:start (fn [] (gs/gen-server (->Db)))})
 (sup/which-children! sup) ;=> [:db]
+(sup/get-child sup :db)   ;=> the child actor
 ```
+
+Pass `:children` (a seq of specs) to `start-supervisor` to start children up
+front. `get-child` returns a child's actor, `remove-child!` untracks it without
+stopping it, and `remove-and-terminate-child!` untracks it and best-effort stops
+it (a gen-server child honours the shutdown message).
 
 Strategies are `:one-for-one`, `:one-for-all` and `:rest-for-one`. A child's
 restart type decides whether its exit earns a restart: `:permanent` always,
 `:transient` only on an abnormal exit, `:temporary` never. If restarts exceed
 `max-restarts` within `max-seconds`, the supervisor shuts down.
 
+## Differences from pulsar
+
+The semantics follow pulsar's actor layer, but several surfaces are shaped
+differently. These are deliberate:
+
+- The behaviour protocols carry state explicitly. `Server`/`Handler`/`FSM`
+  handlers receive and return the current state instead of the actor holding it,
+  so a handler is a pure function of `(state, message)`. pulsar's `handle-call`
+  also takes the caller and a message id as separate arguments; here the caller
+  and its reply channel arrive as one `from` map, and `reply!`/`reply-error!`
+  take that `from` rather than `(to id ...)`.
+- `set-timeout!` is gone. A timeout is a trailing element of a handler's tagged
+  return (`[:noreply state timeout-ms]`) rather than a side-effecting call that
+  mutates the current server.
+- gen_event identifies handlers by an explicit `id` you supply; pulsar keys them
+  by the handler object's identity.
+- gen_fsm is record-and-protocol based, returning tagged vectors
+  (`[:next ...]`, `[:reply ...]`, `[:stop ...]`); pulsar drives the machine with
+  a function whose `:done` value terminates it.
+- The behaviours start from plain functions (`start-manager`, `start-fsm`,
+  `start-supervisor`, `gen-server`) that take an already-constructed record,
+  rather than the variadic keyword-args macros pulsar uses.
+- `whereis` does not block: it returns nil when nothing is registered, or polls
+  until a timeout when you pass one.
+- Quasar-era spawn options (`:scheduler`, `:stack-size`, `:lifecycle-handler`)
+  and JVM-only helpers (`log`, `recur-swap`, the `actor`/`defactor` macros,
+  `->Initializer`, `actor-builder`) have no counterpart.
+
 ## Not here yet
 
-Erlang links, monitors and exit signals. Remote nodes and distribution. OTP
-applications and supervision restart ordering with terminate callbacks. Hot code
-reload. Fibers do their own scheduling, so there is no reduction budget or
-preemption either.
+Erlang links and bidirectional exit signals (one-way monitors are covered by
+`watch!`). Remote nodes and distribution. OTP applications and supervision
+restart ordering with terminate callbacks. Hot code reload. Fibers do their own
+scheduling, so there is no reduction budget or preemption either.
 
 ## Tests
 
