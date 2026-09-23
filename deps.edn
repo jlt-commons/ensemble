@@ -1,0 +1,8 @@
+{:paths ["src"]
+
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps  {io.github.jlt-commons/writ
+                       {:git/url "https://github.com/jlt-commons/writ"
+                        :git/sha "56fdcff80c2f69e6f7f61855b2a9cc404073ebb4"}}
+         :main-opts   ["-m" "ensemble.runner"]}}}
