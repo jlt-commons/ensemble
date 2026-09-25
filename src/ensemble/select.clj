@@ -13,24 +13,24 @@
 (defn- idx-match
   "Index in pats of the first pattern msg matches, or nil."
   [pats msg]
-  (loop [i 0 ps pats]
-    (if (seq ps)
-      (if (nil? (match/capture (first ps) msg))
-        (recur (inc i) (rest ps))
-        i)
-      nil)))
+  (first (keep-indexed
+          (fn [i p]
+            (let [b (match/capture p msg)]
+              (if (nil? b) nil i)))
+          pats)))
 
 (defn find-first-of
   "[:None], or [:Take pat-idx msg rest] with rest the mailbox minus msg."
   [mbx pats]
-  (let [xs (vec (mb/msgs mbx))
-        n (count xs)]
-    (loop [i 0]
-      (if (< i n)
-        (let [m (nth xs i)
-              k (idx-match pats m)]
-          (if (nil? k)
-            (recur (inc i))
-            [:Take k m (reduce mb/enqueue [:Empty]
-                              (concat (subvec xs 0 i) (subvec xs (inc i))))]))
-        [:None]))))
+  (let [xs  (vec (mb/msgs mbx))
+        hit (first (keep-indexed
+                    (fn [i m]
+                      (let [k (idx-match pats m)]
+                        (if (nil? k) nil [k i])))
+                    xs))]
+    (if hit
+      (let [[k i] hit]
+        [:Take k (nth xs i)
+         (reduce mb/enqueue [:Empty]
+                 (concat (subvec xs 0 i) (subvec xs (inc i))))])
+      [:None])))

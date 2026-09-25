@@ -11,23 +11,23 @@
                      [:pair x y] matches [:pair 1 2] binding x 1, y 2
 
   Vectors nest, so [x [:tag y]] is a tuple whose second element is itself a
-  tuple.")
+  tuple."
+  (:require [clojure.walk :as walk]))
 
 (defn compile-form
   "Compile a pattern form into the tagged-data form capture matches."
   [pat]
-  (cond
-    (= pat '_) [:Wild]
-    (symbol? pat) [:Bind pat]
-    (vector? pat) (reduce (fn [acc p] [:Cons (compile-form p) acc])
-                          [:Nil]
-                          (reverse pat))
-    :else [:Lit pat]))
+  (walk/postwalk
+   (fn [p]
+     (cond
+       (= p '_) [:Wild]
+       (symbol? p) [:Bind p]
+       (vector? p) (reduce (fn [acc e] [:Cons e acc]) [:Nil] (reverse p))
+       :else [:Lit p]))
+   pat))
 
 (defn bound-syms
   "The symbols a pattern binds, in order."
   [pat]
-  (cond
-    (symbol? pat) (if (= pat '_) [] [pat])
-    (vector? pat) (mapcat bound-syms pat)
-    :else []))
+  (filter (fn [x] (and (symbol? x) (not= x '_)))
+          (tree-seq vector? seq pat)))

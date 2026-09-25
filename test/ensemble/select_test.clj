@@ -31,3 +31,8 @@
     (is (= [:b 2] (nth r 2)))
     (is (= 1 (nth r 1)))
     (is (= [[:a 1]] (vec (mb/msgs (nth r 3)))))))
+
+(deftest keeps-skipped-nil-message
+  (let [r (sel/find-first-of (mb-of [nil [:b 2] :tail]) (pats ['[:b y]]))]
+    (is (= [:b 2] (nth r 2)))
+    (is (= [nil :tail] (vec (mb/msgs (nth r 3)))))))
