@@ -6,7 +6,7 @@
   any clause wins.  The reply carries the index of the clause that matched, the
   message, and the mailbox left behind -- the matched message removed, every
   earlier (skipped) and later message still in place."
-  (:require [writ.spec :refer [spec data ann law]]))
+  (:require [writ.spec :refer [spec data ann refine graph law]]))
 
 (spec ensemble.select)
 
@@ -15,6 +15,20 @@
 (data Scan None (Take Nat Any Mailbox))
 
 (ann find-first-of [Mailbox (Vec Pattern) -> Scan])
+
+;; --- the state graph ----------------------------------------------------
+
+(refine Idle    [mb Mailbox] (= :Empty (first mb)))
+(refine Pending [mb Mailbox] (= :Msg (first mb)))
+(refine Missed  [r Scan] (= :None (first r)))
+(refine Taken   [r Scan] (= :Take (first r)))
+
+;; an empty mailbox never gives up a message; a pending one may, whichever
+;; clause it matches
+(graph receive
+  {:states {:idle Idle, :pending Pending, :missed Missed, :taken Taken}
+   :edges  {:idle    {[find-first-of (Vec Pattern)] #{:missed}}
+            :pending {[find-first-of (Vec Pattern)] #{:missed :taken}}}})
 
 (defn build [vs] (reduce (fn [mb v] [:Msg v mb]) [:Empty] (reverse vs)))
 

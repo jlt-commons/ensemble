@@ -11,20 +11,30 @@
                      [:pair x y] matches [:pair 1 2] binding x 1, y 2
 
   Vectors nest, so [x [:tag y]] is a tuple whose second element is itself a
-  tuple."
-  (:require [clojure.walk :as walk]))
+  tuple.  Any other value, a map or a list among them, is a literal as
+  written.")
+
+(defn- compile-atom
+  "A pattern form that is not a tuple."
+  [p]
+  (cond
+    (= p '_) [:Wild]
+    (symbol? p) [:Bind p]
+    :else [:Lit p]))
+
+(defn- compile-tuple
+  "The elements of a tuple pattern, compiled and right-nested."
+  [ps]
+  (if (empty? ps)
+    [:Nil]
+    (let [p (first ps)]
+      [:Cons (if (vector? p) (compile-tuple p) (compile-atom p))
+             (compile-tuple (rest ps))])))
 
 (defn compile-form
   "Compile a pattern form into the tagged-data form capture matches."
   [pat]
-  (walk/postwalk
-   (fn [p]
-     (cond
-       (= p '_) [:Wild]
-       (symbol? p) [:Bind p]
-       (vector? p) (reduce (fn [acc e] [:Cons e acc]) [:Nil] (reverse p))
-       :else [:Lit p]))
-   pat))
+  (if (vector? pat) (compile-tuple pat) (compile-atom pat)))
 
 (defn bound-syms
   "The symbols a pattern binds, in order."

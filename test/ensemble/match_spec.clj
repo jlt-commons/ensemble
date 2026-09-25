@@ -1,7 +1,7 @@
 (ns ensemble.match-spec
   "The contract for ensemble.match: a compiled receive pattern matched against
   a message either fails (nil) or yields the bindings it captured."
-  (:require [writ.spec :refer [spec data ann law]]))
+  (:require [writ.spec :refer [spec data ann refine graph law]]))
 
 (spec ensemble.match)
 
@@ -13,6 +13,25 @@
   (Cons Pattern Pattern))
 
 (ann capture [Pattern Any -> Any])
+
+;; --- the state graph ----------------------------------------------------
+
+(refine WildP  [p Pattern] (= :Wild (first p)))
+(refine BindP  [p Pattern] (= :Bind (first p)))
+(refine LitP   [p Pattern] (= :Lit (first p)))
+(refine TupleP [p Pattern] (contains? #{:Nil :Cons} (first p)))
+(refine Matched [b Any] (map? b))
+(refine Outcome [b Any] (or (nil? b) (map? b)))
+
+;; a wildcard or a binder takes any message; a literal or a tuple may also
+;; refuse it, with nil -- which ones match is pinned by the laws below
+(graph capture
+  {:states {:wild WildP, :bind BindP, :lit LitP, :tuple TupleP,
+            :matched Matched, :outcome Outcome}
+   :edges  {:wild  {[capture Any] #{:matched}}
+            :bind  {[capture Any] #{:matched}}
+            :lit   {[capture Any] #{:outcome}}
+            :tuple {[capture Any] #{:outcome}}}})
 
 (def two-tuple [:Cons [:Wild] [:Nil]])
 (def bind-pair [:Cons [:Bind 'l] [:Cons [:Bind 'r] [:Nil]]])
