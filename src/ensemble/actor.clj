@@ -238,6 +238,14 @@
   (when-let [sig (claim-exit (:mailbox actor) @(:trapping actor))]
     (throw (ex-info "linked exit" {::exit (nth sig 2)}))))
 
+(defn- fatal-exit?
+  "True when a just-claimed message is an exit signal the actor must die from
+  rather than handle.  Guards the race where a catch-all pattern would
+  otherwise swallow an exit signal that arrived after enforce-exit! ran."
+  [actor m]
+  (and (exit-signal? m)
+       (or (not @(:trapping actor)) (= :killed (nth m 2)))))
+
 (defn receive-match
   "Block until a mailbox message matches one of pats.  Returns [pat-idx msg env]
   with msg the message and env the captured bindings, or [:timeout {}] when
@@ -248,7 +256,9 @@
     (if-let [t (claim-of (:mailbox actor) pats)]
       (let [idx (nth t 0)
             msg (nth t 1)]
-        [idx msg (match/capture (nth pats idx) msg)])
+        (if (fatal-exit? actor msg)
+          (throw (ex-info "linked exit" {::exit (nth msg 2)}))
+          [idx msg (match/capture (nth pats idx) msg)]))
       (let [bell @(:doorbell actor)]
         (if (some? timeout-ms)
           (let [[v _] (a/alts!! [bell (a/timeout timeout-ms)])]
