@@ -147,6 +147,50 @@
     (is (= [:a] (sup/which-children! sup)))
     (is (= 1 @a))))
 
+(defn- tracked
+  "A child start fn: append id to log, then wait for a message.  :die kills it
+  so a restart, and the order the children restart in, can be observed."
+  [log id]
+  (fn []
+    (swap! log conj id)
+    (act/spawn (fn [] (act/receive [:die (throw (ex-info "child died" {}))]
+                                   [[:ensemble/shutdown _] :ok]
+                                   [_ :ok])))))
+
+(deftest one-for-all-restarts-in-start-order
+  (let [log (atom [])
+        sup (sup/start-supervisor {:strategy :one-for-all :max-restarts 5})]
+    (sup/start-child! sup :a {:start (tracked log :a)})
+    (sup/start-child! sup :b {:start (tracked log :b)})
+    (sup/start-child! sup :c {:start (tracked log :c)})
+    (is (= [:a :b :c] @log))
+    (act/! (sup/get-child sup :b) :die)
+    (is (eventually (fn [] (= [:a :b :c :a :b :c] @log))))))
+
+(defrecord Terminator [log id]
+  gs/Server
+  (init [_] nil)
+  (handle-call [_ _from _msg st] [:reply :ok st])
+  (handle-cast [_ _msg st] [:noreply st])
+  (handle-info [_ _msg st] [:noreply st])
+  (handle-timeout [_ st] [:noreply st])
+  (terminate [_ _reason _st] (swap! log conj id)))
+
+(defn- terminating
+  "A child start fn: a gen-server that appends id to log when it is terminated."
+  [log id]
+  (fn [] (gs/gen-server (->Terminator log id))))
+
+(deftest shutdown-runs-child-terminates-in-stop-order
+  (let [log (atom [])
+        sup (sup/start-supervisor {:strategy :one-for-one})]
+    (sup/start-child! sup :a {:start (terminating log :a)})
+    (sup/start-child! sup :b {:start (terminating log :b)})
+    (sup/start-child! sup :c {:start (terminating log :c)})
+    (sup/stop-supervisor! sup)
+    (is (= [:c :b :a] @log))
+    (is (act/done? sup))))
+
 (deftest permanent-child-restarts-on-normal-exit
   (let [a (atom 0) kill (atom nil)
         sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 5})]

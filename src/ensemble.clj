@@ -15,6 +15,7 @@
       ensemble.gen-event   gen_event behaviour: manager + handlers
       ensemble.gen-fsm     gen_fsm behaviour: named states + events
       ensemble.supervisor  supervision trees: restart strategies
+      ensemble.application OTP applications: named start/stop
 
   Patterns in receive are the compiled forms of ensemble.pattern: a symbol
   binds the whole message, _ matches anything, literals match themselves, and
@@ -23,7 +24,8 @@
             [ensemble.gen-server :as gs]
             [ensemble.gen-event :as ge]
             [ensemble.gen-fsm :as gf]
-            [ensemble.supervisor :as sup]))
+            [ensemble.supervisor :as sup]
+            [ensemble.application :as app]))
 
 ;; actors ---------------------------------------------------------------
 
@@ -89,6 +91,13 @@
 (def remove-child! sup/remove-child!)
 (def remove-and-terminate-child! sup/remove-and-terminate-child!)
 (def which-children! sup/which-children!)
+(def stop-supervisor! sup/stop-supervisor!)
+
+;; applications ---------------------------------------------------------
+
+(def start-application app/start-application)
+(def stop-application app/stop-application)
+(def started? app/started?)
 
 ;; behaviours (implement these on a record) -----------------------------
 

@@ -24,6 +24,7 @@
   ignored instead of triggering a spurious restart."
   (:require [jolt.fibers :as fib]
             [ensemble.actor :as act]
+            [ensemble.order :as ord]
             [ensemble.gen-server :as gs]))
 
 (defn- start-child-actor [spec] ((:start spec)))
@@ -54,15 +55,15 @@
 (defn- prune-window [times max-ms now]
   (filterv (fn [t] (<= (- now t) max-ms)) times))
 
-(defn- child-index [children id]
-  (first (keep-indexed (fn [i c] (when (= (:id c) id) i)) children)))
+(defn- child-by-id [children id]
+  (first (filter (fn [c] (= (:id c) id)) children)))
 
-(defn- restart-ids [strategy children id]
+(defn- restart-ids
+  "The set of child ids to restart when id fails under strategy.  The plan is
+  in start order, but membership is what the restart loop needs."
+  [strategy children id]
   (let [ids (mapv :id children)]
-    (case strategy
-      :one-for-all (set ids)
-      :rest-for-one (set (subvec ids (child-index children id)))
-      (hash-set id))))
+    (set (ord/plan-ids (ord/restart-order strategy ids id) ids))))
 
 (defn- drop-child [st id]
   (update st :children (fn [cs] (filterv (fn [c] (not= (:id c) id)) cs))))
@@ -91,11 +92,11 @@
       [:reply :ok (drop-child st (nth msg 1))]
       :remove-and-terminate-child
       (let [id (nth msg 1)
-            c (first (filter (fn [x] (= (:id x) id)) (:children st)))]
+            c (child-by-id (:children st) id)]
         (when-let [a (:actor c)] (act/! a [:ensemble/shutdown :shutdown]))
         [:reply :ok (drop-child st id)])
       :get-child
-      (let [c (first (filter (fn [x] (= (:id x) (nth msg 1))) (:children st)))]
+      (let [c (child-by-id (:children st) (nth msg 1))]
         [:reply (:actor c) st])
       :which-children
       [:reply (mapv :id (:children st)) st]))
@@ -119,7 +120,12 @@
                              (:children st))]
           [:noreply {:children children :restarts (conj window now)}]))))
   (handle-timeout [_ st] [:noreply st])
-  (terminate [_ _reason _st] nil))
+  (terminate [_ _reason st]
+    (let [ids (mapv :id (:children st))]
+      (doseq [id (ord/plan-ids (ord/stop-order ids) ids)]
+        (when-let [a (:actor (child-by-id (:children st) id))]
+          (act/! a [:ensemble/shutdown :shutdown])
+          (try (act/join a 1000) (catch Throwable _ nil)))))))
 
 (defn start-supervisor
   "Start a supervisor.  Options:
@@ -162,3 +168,12 @@
   "The ids of the supervisor's live children, in start order."
   [sup]
   (gs/call! sup [:which-children]))
+
+(defn stop-supervisor!
+  "Stop the supervisor and its tree.  Children are terminated in stop order
+  (start order reversed), each running its terminate, then the supervisor
+  stops.  Blocks until the whole tree has settled.  Returns sup."
+  [sup]
+  (gs/shutdown! sup :shutdown)
+  (try (act/join sup) (catch Throwable _ nil))
+  sup)
