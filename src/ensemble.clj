@@ -45,6 +45,10 @@
 (def mailbox-of act/mailbox-of)
 (def watch! act/watch!)
 (def unwatch! act/unwatch!)
+(def link! act/link!)
+(def unlink! act/unlink!)
+(def trap-exit! act/trap-exit!)
+(def exit! act/exit!)
 
 (defmacro receive
   "Selective receive over the current actor's mailbox.  See ensemble.actor."

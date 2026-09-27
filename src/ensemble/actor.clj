@@ -15,6 +15,9 @@
        :state   atom  the actor's current state
        :done    promise  [:ok v] or [:err e] once the body returns
        :name    the registered name, or nil
+       :pid     the process id, a link-table key
+       :links   atom  the set of linked actors
+       :trapping atom true when exit signals arrive as messages
        ::actor  true     marks the map as an actor}
 
   ::actor is what actor? checks, so a plain map that happens to carry a
@@ -38,8 +41,25 @@
 
 (defonce ^:private registry (atom {}))
 
+(defonce ^:private pids (atom 0))
+
+(defn- next-pid
+  "A fresh process id, so the links table can key on distinct actors."
+  []
+  (swap! pids inc))
+
+(defn- exit-reason
+  "The reason an actor settles with: :normal when its body returns, else the
+  reason carried by a link signal, or the throwable itself."
+  [ok? err]
+  (if ok?
+    :normal
+    (let [d (ex-data err)]
+      (if (and (map? d) (contains? d ::exit)) (::exit d) err))))
+
 (declare ^:private drop-watches-of!)
 (declare ^:private notify-watchers!)
+(declare ^:private propagate-exit!)
 
 (defn- actor? [x]
   (and (map? x) (contains? x ::actor)))
@@ -111,9 +131,10 @@
 
 (defn- signal! [actor] (a/>!! @(:doorbell actor) true))
 
-(defn- actor-obj [fiber mailbox doorbell state done name]
+(defn- actor-obj [fiber mailbox doorbell state done name pid]
   {:fiber fiber :mailbox mailbox :doorbell doorbell
-   :state state :done done :name name ::actor true})
+   :state state :done done :name name :pid pid
+   :links (atom #{}) :trapping (atom false) ::actor true})
 
 (defn spawn
   "Start an actor running f on a fiber.  f is called with no arguments and its
@@ -134,12 +155,15 @@
                 (fn []
                   (binding [*actor* @me]
                     (let [r (try {:ok (f)} (catch Throwable e {:err e}))
-                          ok? (contains? r :ok)]
+                          ok? (contains? r :ok)
+                          reason (exit-reason ok? (:err r))
+                          clean? (or ok? (= :normal reason))]
+                      (deliver done (if clean? [:ok (:ok r)] [:err (:err r)]))
                       (drop-watches-of! @me)
-                      (deliver done (if ok? [:ok (:ok r)] [:err (:err r)]))
-                      (notify-watchers! @me (when-not ok? (:err r)))
-                      (if ok? (:ok r) (throw (:err r)))))))
-         actor (actor-obj fiber mbox bell st done (:name opts))]
+                      (propagate-exit! @me reason)
+                      (notify-watchers! @me (when-not clean? (:err r)))
+                      (if clean? (:ok r) (throw (:err r)))))))
+         actor (actor-obj fiber mbox bell st done (:name opts) (next-pid))]
      (deliver me actor)
      (when (:name opts) (register! (:name opts) actor))
      actor)))
@@ -178,12 +202,49 @@
                  m))))
     @taken))
 
+(defn- exit-signal?
+  "A pending exit signal delivered by a link: [:EXIT from-pid reason]."
+  [m]
+  (and (vector? m) (= 3 (count m)) (= :EXIT (nth m 0))))
+
+(defn- claim-exit
+  "Atomically take the first exit signal the actor must act on out of the
+  mailbox, leaving the rest.  A trapping actor keeps ordinary signals (they
+  arrive as messages); :killed is never trappable, so it is always taken.
+  Returns the signal or nil."
+  [mbox-atom trapping?]
+  (let [taken (volatile! nil)]
+    (swap! mbox-atom
+           (fn [m]
+             (let [xs (vec (mb/msgs m))
+                   i  (first (keep-indexed
+                              (fn [i x]
+                                (when (and (exit-signal? x)
+                                           (or (not trapping?) (= :killed (nth x 2))))
+                                  i))
+                              xs))]
+               (if (some? i)
+                 (do (vreset! taken (nth xs i))
+                     (reduce mb/enqueue [:Empty]
+                             (concat (subvec xs 0 i) (subvec xs (inc i)))))
+                 m))))
+    @taken))
+
+(defn- enforce-exit!
+  "Before taking an ordinary message, a linked exit signal kills the actor.  A
+  trapping actor keeps it as a message; a non-trapping actor throws, carrying
+  the reason so the settle path forwards it to the actor's own links."
+  [actor]
+  (when-let [sig (claim-exit (:mailbox actor) @(:trapping actor))]
+    (throw (ex-info "linked exit" {::exit (nth sig 2)}))))
+
 (defn receive-match
   "Block until a mailbox message matches one of pats.  Returns [pat-idx msg env]
   with msg the message and env the captured bindings, or [:timeout {}] when
   timeout-ms elapses first.  With timeout-ms nil it waits forever."
   [actor pats timeout-ms]
   (loop []
+    (enforce-exit! actor)
     (if-let [t (claim-of (:mailbox actor) pats)]
       (let [idx (nth t 0)
             msg (nth t 1)]
@@ -326,3 +387,69 @@
   [ref]
   (swap! watches dissoc ref)
   nil)
+
+;; links and exit signals ------------------------------------------------
+
+(defn- done-reason
+  "The reason an actor settled with.  Only call once it is settled."
+  [actor]
+  (let [[tag v] @(:done actor)]
+    (exit-reason (= :ok tag) (when (= :err tag) v))))
+
+(defn- signal-exit!
+  "Send the exit signal of a dead actor to a linked survivor, unless the exit
+  was normal (benign) or the survivor has already settled."
+  [dead alive]
+  (when-not (settled? alive)
+    (let [reason (done-reason dead)]
+      (when (not= :normal reason)
+        (! alive [:EXIT (:pid dead) reason])))))
+
+(defn- propagate-exit!
+  "On settling abnormally, forward the exit signal to every actor linked to
+  actor.  The reason is carried unchanged, so a cascade of links all die with
+  the original reason; a trapping actor stops the cascade.  The reason is
+  passed in rather than read back from :done, because a settling actor has not
+  delivered :done yet and reading it here would deadlock."
+  [actor reason]
+  (when (not= :normal reason)
+    (doseq [other @(:links actor)]
+      (when-not (settled? other)
+        (! other [:EXIT (:pid actor) reason])))))
+
+(defn link!
+  "Link the current actor and other.  If either exits abnormally the other is
+  sent the exit signal and dies too, unless it traps exits.  Links are mutual
+  and idempotent.  Returns other.  If other has already exited abnormally, the
+  current actor is signalled at once."
+  ([other] (link! (self) other))
+  ([a b]
+   (when-not (= (:pid a) (:pid b))
+     (swap! (:links a) conj b)
+     (swap! (:links b) conj a)
+     (when (settled? a) (signal-exit! a b))
+     (when (settled? b) (signal-exit! b a)))
+   b))
+
+(defn unlink!
+  "Remove the link between the current actor and other.  Returns other."
+  ([other] (unlink! (self) other))
+  ([a b]
+   (swap! (:links a) disj b)
+   (swap! (:links b) disj a)
+   b))
+
+(defn trap-exit!
+  "Make the current actor trap exits.  With trapping on, an incoming exit signal
+  arrives as an ordinary [:EXIT from reason] message instead of killing the
+  actor; :killed is still never trappable.  (trap-exit! false) stops trapping.
+  Returns the actor."
+  ([] (trap-exit! true))
+  ([on] (reset! (:trapping (self)) (boolean on)) (self)))
+
+(defn exit!
+  "Exit the current actor with reason.  :normal is a quiet stop (join returns
+  nil, linked actors are unaffected); any other reason is abnormal and
+  propagates to the actor's links."
+  ([] (exit! :normal))
+  ([reason] (throw (ex-info "exit" {::exit reason}))))
