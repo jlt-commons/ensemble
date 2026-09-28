@@ -41,6 +41,7 @@
       (nil? i) []
       (= :one-for-all strategy) (vec children)
       (= :rest-for-one strategy) (vec (drop i children))
+      ;; :one-for-one, and :simple-one-for-one, its dynamic kind
       :else [(nth children i)])))
 
 (defn restart-plan
@@ -56,6 +57,21 @@
      (vec (keep (fn [c] (when (or (= id (first c)) (not= :temporary (second c)))
                           (first c)))
                 hit))]))
+
+(defn auto-shutdown?
+  "Does a child that exited with reason shut its supervisor down on its
+  own?  Only a significant child that is not restarted -- a :transient one
+  ending in an orderly way, a :temporary one ending any way -- and then at
+  once under :any-significant, or under :all-significant when no other
+  significant child is still running (left of them are).  Under :never,
+  never."
+  [auto significant? restart reason left]
+  (and significant?
+       (not (restart? restart reason))
+       (case auto
+         :any-significant true
+         :all-significant (= 0 left)
+         false)))
 
 (defn stop-order
   "The ids in the order the children stop: start order reversed."

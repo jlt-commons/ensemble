@@ -10,14 +10,21 @@
     does that for the children started after it.  Children stop in reverse
     start order and start in start order.  A :temporary child the strategy
     stops is not started again.
-  - More than intensity restarts within period and the supervisor gives up."
+  - :simple-one-for-one is one-for-one for children started from one
+    template: a child is restarted alone.
+  - More than intensity restarts within period and the supervisor gives up.
+  - A significant child that terminates on its own and is not restarted
+    shuts its supervisor down: at once under :any-significant, and when it
+    was the last significant child running under :all-significant.  Under
+    :never, the default, nothing does."
   (:require [writ.spec :refer [spec data ann refine graph law calls]]
             [ensemble.order :as ord]
             [ensemble.supervisor :as sup]))
 
 (spec ensemble.order {:require :proved})
 
-(refine Strategy [s Keyword] (contains? #{:one-for-one :one-for-all :rest-for-one} s))
+(refine Strategy [s Keyword] (contains? #{:one-for-one :one-for-all :rest-for-one :simple-one-for-one} s))
+(refine AutoShutdown [a Keyword] (contains? #{:never :any-significant :all-significant} a))
 (refine Restart  [r Keyword] (contains? #{:permanent :transient :temporary} r))
 
 (data Plan (Plan (Vec Nat) (Vec Nat)))
@@ -28,6 +35,7 @@
 (ann restart-plan [Strategy (Vec (Tuple Nat Restart)) Nat -> Plan])
 (ann stop-order [(Vec Nat) -> (Vec Nat)])
 (ann intensity [(Vec Int) Int Nat Nat -> Verdict])
+(ann auto-shutdown? [AutoShutdown Bool Restart Any Nat -> Bool])
 
 ;; --- the state graph ----------------------------------------------------
 
@@ -58,7 +66,7 @@
     (if (nil? i)
       [:Plan [] []]
       (let [hit (case strategy
-                  :one-for-one [(nth cs i)]
+                  (:one-for-one :simple-one-for-one) [(nth cs i)]
                   :one-for-all cs
                   :rest-for-one (drop i cs))
             others (remove #(= id (first %)) hit)]
@@ -163,6 +171,38 @@
     (=> (< i (count cs))
         (some #{(first (nth cs i))} (nth (restart-plan s cs (first (nth cs i))) 2)))))
 
+(law simple-one-for-one-restarts-the-child-alone
+  (forall [cs (Vec (Tuple Nat Restart)), id Nat]
+    (= (restart-plan :simple-one-for-one cs id) (restart-plan :one-for-one cs id))))
+
+;; --- shutting down on its own -------------------------------------------
+
+(law never-means-no-child-shuts-it-down
+  (forall [sig Bool, r Restart, reason Any, left Nat]
+    (not (auto-shutdown? :never sig r reason left))))
+
+(law an-insignificant-child-never-shuts-it-down
+  (forall [a AutoShutdown, r Restart, reason Any, left Nat]
+    (not (auto-shutdown? a false r reason left))))
+
+(law a-child-that-is-restarted-shuts-nothing-down
+  (forall [a AutoShutdown, r Restart, reason Any, left Nat]
+    (=> (restart? r reason) (not (auto-shutdown? a true r reason left)))))
+
+(law any-significant-shuts-down-when-one-ends
+  (forall [r Restart, reason Any, left Nat]
+    (=> (not (restart? r reason)) (auto-shutdown? :any-significant true r reason left))))
+
+(law all-significant-shuts-down-when-the-last-ends
+  (forall [r Restart, reason Any, left Nat]
+    (=> (not (restart? r reason))
+        (= (auto-shutdown? :all-significant true r reason left) (= 0 left)))))
+
+(law a-transient-child-ending-normally-shuts-it-down
+  (and (auto-shutdown? :any-significant true :transient :normal 3)
+       (not (auto-shutdown? :any-significant true :transient :crashed 3))
+       (auto-shutdown? :any-significant true :temporary :crashed 3)))
+
 (law stop-order-reverses-start-order
   (forall [ids (Vec Nat)] (= (stop-order ids) (vec (reverse ids)))))
 
@@ -189,5 +229,5 @@
 ;; --- the supervisor decides through these -------------------------------
 
 (calls sup/restart {:through [ord/restart-plan]})
-(calls sup/child-exited {:through [ord/restart? ord/intensity ord/restart-plan]})
+(calls sup/child-exited {:through [ord/restart? ord/intensity ord/restart-plan ord/auto-shutdown?]})
 (calls sup/stop-all {:through [ord/stop-order]})

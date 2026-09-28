@@ -25,24 +25,72 @@
   it at its next receive, or as its body returns.
 
   An actor is a map; treat it as opaque.  Two actors are equal when they are
-  the same process.  It prints as #<actor pid>."
+  the same process.  It prints as #<actor pid>.
+
+  Every actor belongs to a node (*node*, :nonode@nohost until
+  ensemble.node starts one), and names are registered per node.  Links and
+  monitors hold process handles (ensemble.process), so the other end of one
+  may be a pid on another node: every operation on another process goes
+  through the Process protocol, which ensemble.node implements for remote
+  pids."
   (:require [clojure.core.async :as a]
             [jolt.fibers :as fib]
+            [ensemble.process :as proc]
             [ensemble.pattern :as pattern]
             [ensemble.select :as select]
             [ensemble.signal :as sig]))
 
 (def ^:dynamic *actor* nil)
 
+(def ^:dynamic *node*
+  "The node code outside any actor runs as; an actor runs as its own."
+  :nonode@nohost)
+
 (defn self
   "The actor this code is running as, or nil outside an actor."
   []
   *actor*)
 
+(defn node
+  "The node the current code runs on: its actor's, or *node*."
+  []
+  (if-let [a *actor*] (::node a) *node*))
+
 (defn actor?
-  "True when x is an actor."
+  "True when x is a local actor."
   [x]
   (and (map? x) (contains? x ::pid)))
+
+(defn remote?
+  "True when x is a handle on a process of another node."
+  [x]
+  (and (record? x) (proc/process? x)))
+
+(defn pid?
+  "True when x is a process handle, local or remote (Erlang's is_pid)."
+  [x]
+  (or (actor? x) (remote? x)))
+
+(defonce ^:private remote-resolver
+  ;; set by ensemble.node: a destination this node cannot resolve itself,
+  ;; [:At name node], to a handle
+  (atom nil))
+
+(defonce ^:private remote-alias-sender
+  ;; set by ensemble.node: how a message to an alias owned on another node
+  ;; gets there
+  (atom nil))
+
+(defn set-remote-alias-sender!
+  "Install how send-alias! reaches an alias owned on another node."
+  [f]
+  (reset! remote-alias-sender f))
+
+(defn set-remote-resolver!
+  "Install how a destination on another node, [:At name node], becomes a
+  process handle.  ensemble.node calls this when it starts a node."
+  [f]
+  (reset! remote-resolver f))
 
 (defmethod print-method ::actor [x ^java.io.Writer w]
   (.write w (str "#<actor " (::pid x) ">")))
@@ -81,9 +129,9 @@
   (open? @(::links actor)))
 
 (defn whereis
-  "The live actor registered under nm, or nil."
+  "The live actor registered under nm on this node, or nil."
   [nm]
-  (let [a (get @registry (norm-name nm))]
+  (let [a (get-in @registry [(node) (norm-name nm)])]
     (when (and a (alive? a)) a)))
 
 (defn register!
@@ -92,10 +140,12 @@
   actor is dead, or when the actor already has a name.  The name is released
   when the actor exits.  Returns the actor."
   [nm actor]
-  (let [k (norm-name nm)]
+  (let [k (norm-name nm)
+        n (::node actor)]
     (swap! registry
-           (fn [r]
-             (let [holder (get r k)]
+           (fn [all]
+             (let [r (get all n {})
+                   holder (get r k)]
                (cond
                  (and holder (alive? holder))
                  (throw (ex-info "name already registered" {:reason :badarg :name nm}))
@@ -103,26 +153,34 @@
                  (throw (ex-info "cannot register a dead actor" {:reason :badarg :name nm}))
                  (some (fn [[k2 v]] (and (not= k k2) (= v actor) (alive? v))) r)
                  (throw (ex-info "actor already has a name" {:reason :badarg :name nm}))
-                 :else (assoc r k actor)))))
+                 :else (assoc-in all [n k] actor)))))
     actor))
 
 (defn unregister!
   "Release the name nm.  Returns nil."
   [nm]
-  (swap! registry dissoc (norm-name nm))
+  (swap! registry update (node) dissoc (norm-name nm))
   nil)
 
 (defn registered
   "The names of the live registered actors."
   []
-  (vec (keep (fn [[k v]] (when (alive? v) k)) @registry)))
+  (vec (keep (fn [[k v]] (when (alive? v) k)) (get @registry (node)))))
 
 (defn resolve-dest
-  "An actor from an actor or a registered name.  Sending to a name nobody
-  holds throws, as Erlang's Name ! Msg does."
+  "A process handle from a handle, a name registered on this node, or a
+  name on another, [:At name node].  Sending to a name nobody holds
+  throws, as Erlang's Name ! Msg does."
   [dest]
-  (if (actor? dest)
-    dest
+  (cond
+    (pid? dest) dest
+    (and (vector? dest) (= :At (first dest)))
+    (if (= (nth dest 2) (node))
+      (resolve-dest (second dest))
+      (if-let [f @remote-resolver]
+        (f dest)
+        (throw (ex-info "no connection to that node" {:reason :noconnection :dest dest}))))
+    :else
     (or (whereis dest)
         (throw (ex-info "no actor registered under name" {:reason :badarg :name dest})))))
 
@@ -140,11 +198,12 @@
     (ring! actor)))
 
 (defn !
-  "Send msg to dest, an actor or a registered name.  Never blocks.  Returns
-  msg.  A message to a dead actor is silently dropped; a message to a name
-  nobody holds throws."
+  "Send msg to dest, a process (on this node or another), a registered
+  name, or [:At name node].  Never blocks.  Returns msg.  A message to a
+  dead process is silently dropped; a message to a name nobody holds
+  throws."
   [dest msg]
-  (enqueue! (resolve-dest dest) msg)
+  (proc/-deliver (resolve-dest dest) msg)
   msg)
 
 ;; exit signals ---------------------------------------------------------
@@ -164,7 +223,7 @@
 (defn- linked-to?
   [actor from]
   (let [ls @(::links actor)]
-    (and (open? ls) (contains? ls (::pid from)))))
+    (and (open? ls) (contains? ls from))))
 
 (defn- kill!
   "Make actor die of reason now, wherever it is: claim its death once, then
@@ -202,7 +261,7 @@
   [actor {:keys [kind from reason checked]}]
   (when (or (not= :link kind) (not checked) (linked-to? actor from))
     (when (= :link kind)
-      (swap! (::links actor) (fn [ls] (if (open? ls) (disj ls (::pid from)) ls))))
+      (swap! (::links actor) (fn [ls] (if (open? ls) (disj ls from) ls))))
     (let [act (sig/on-signal @(::trapping actor) kind reason (= from actor))]
       (case (first act)
         :Die     (throw (exit-ex (second act)))
@@ -230,7 +289,7 @@
   ([reason] (throw (exit-ex reason)))
   ([actor reason]
    (let [actor (resolve-dest actor)]
-     (signal! actor {:kind :exit :from (self) :reason reason})
+     (proc/-signal actor (self) :exit reason false)
      (when (= actor (self)) (drain-signals! actor))
      true)))
 
@@ -253,13 +312,11 @@
   (let [me (self)
         other (resolve-dest other)]
     (when-not (= me other)
-      (swap! (::links me) (fn [ls] (if (open? ls) (conj ls (::pid other)) ls)))
-      (let [[before _] (swap-vals! (::links other)
-                                   (fn [ls] (if (open? ls) (conj ls (::pid me)) ls)))]
-        (when-not (open? before)
-          (swap! (::links me) (fn [ls] (if (open? ls) (disj ls (::pid other)) ls)))
-          (signal! me {:kind :link :from other :reason :noproc :checked false})
-          (drain-signals! me))))
+      (swap! (::links me) (fn [ls] (if (open? ls) (conj ls other) ls)))
+      (when-not (proc/-link other me)
+        (swap! (::links me) (fn [ls] (if (open? ls) (disj ls other) ls)))
+        (signal! me {:kind :link :from other :reason :noproc :checked false})
+        (drain-signals! me)))
     true))
 
 (defn unlink!
@@ -267,10 +324,9 @@
   other already on its way is dropped.  Returns true."
   [other]
   (let [me (self)
-        other (resolve-dest other)
-        drop-pid (fn [pid] (fn [ls] (if (open? ls) (disj ls pid) ls)))]
-    (swap! (::links me) (drop-pid (::pid other)))
-    (swap! (::links other) (drop-pid (::pid me)))
+        other (resolve-dest other)]
+    (swap! (::links me) (fn [ls] (if (open? ls) (disj ls other) ls)))
+    (proc/-unlink other me)
     true))
 
 ;; monitors -------------------------------------------------------------
@@ -288,6 +344,8 @@
   [actor ref]
   (swap! (::monitors actor) (fn [ms] (if (open? ms) (dissoc ms ref) ms))))
 
+(defn- watched? [x] (and (some? x) (not= ::firing x)))
+
 (defn monitor!
   "Monitor actor from the current actor.  Returns a ref.  When actor exits,
   the current actor receives [:DOWN ref :process actor reason]; if it is
@@ -302,11 +360,11 @@
     ;; the entry in watching is a one-shot claim: the DOWN is sent only by
     ;; whoever turns it to ::firing, and demonitor! only by removing it, so
     ;; a demonitor that wins knows no DOWN will ever come
-    (add-monitor! actor ref
+    (proc/-add-monitor actor ref
                   (fn [reason]
                     (let [[before _] (swap-vals! watching
-                                                 (fn [w] (if (actor? (get w ref)) (assoc w ref ::firing) w)))]
-                      (when (actor? (get before ref))
+                                                 (fn [w] (if (watched? (get w ref)) (assoc w ref ::firing) w)))]
+                      (when (watched? (get before ref))
                         (enqueue! me [:DOWN ref :process actor reason])
                         (swap! watching dissoc ref)))))))
 
@@ -324,11 +382,11 @@
   ([ref {:keys [flush]}]
    (let [me (self)
          watching (::monitoring me)
-         [before _] (swap-vals! watching (fn [w] (if (actor? (get w ref)) (dissoc w ref) w)))
+         [before _] (swap-vals! watching (fn [w] (if (watched? (get w ref)) (dissoc w ref) w)))
          target (get before ref)]
-     (if (actor? target)
+     (if (watched? target)
        ;; claimed before the DOWN was: none is in the mailbox or coming
-       (drop-monitor! target ref)
+       (proc/-drop-monitor target ref)
        (do
          ;; the target is sending the DOWN right now: let it land, so the
          ;; flush sees it (the window is two swaps, it never parks)
@@ -342,12 +400,12 @@
   already.  The hook for code off any actor (a thread waiting on a reply)
   that has no mailbox to receive a DOWN in.  Returns a ref for cancel-exit!."
   [actor f]
-  (add-monitor! (resolve-dest actor) (make-ref) f))
+  (proc/-add-monitor (resolve-dest actor) (make-ref) f))
 
 (defn cancel-exit!
   "Cancel an on-exit! hook."
   [actor ref]
-  (drop-monitor! (resolve-dest actor) ref)
+  (proc/-drop-monitor (resolve-dest actor) ref)
   nil)
 
 ;; aliases --------------------------------------------------------------
@@ -359,7 +417,7 @@
   the call gave up is dropped instead of lingering in the mailbox."
   []
   (let [me (self)
-        ref (assoc (make-ref) ::owner (::pid me))]
+        ref (assoc (make-ref) ::owner (::pid me) ::owner-node (::node me))]
     (swap! (::aliases me) conj ref)
     ref))
 
@@ -373,9 +431,12 @@
   "Send msg to the actor owning alias, if the alias is still active; otherwise
   drop it.  Returns msg."
   [alias msg]
-  (when-let [owner (get @procs (::owner alias))]
-    (when (contains? @(::aliases owner) alias)
-      (enqueue! owner msg)))
+  (if (and (::owner-node alias) (not= (::owner-node alias) (node)) @remote-alias-sender)
+    ;; the owner is on another node, which checks the alias is still active
+    (@remote-alias-sender alias msg)
+    (when-let [owner (get @procs (::owner alias))]
+      (when (contains? @(::aliases owner) alias)
+        (enqueue! owner msg))))
   msg)
 
 ;; spawning and exiting -------------------------------------------------
@@ -386,17 +447,17 @@
   [me reason]
   (let [[links _] (swap-vals! (::links me) (constantly ::closed))
         [mons _]  (swap-vals! (::monitors me) (constantly ::closed))]
-    (swap! registry (fn [r] (into {} (remove (fn [[_ v]] (= v me))) r)))
-    (doseq [[ref target] @(::monitoring me) :when (actor? target)] (drop-monitor! target ref))
+    (swap! registry update (::node me) (fn [r] (into {} (remove (fn [[_ v]] (= v me))) r)))
+    (doseq [[ref target] @(::monitoring me) :when (watched? target)] (proc/-drop-monitor target ref))
     (swap! procs dissoc (::pid me))
-    (doseq [pid links]
-      (when-let [other (get @procs pid)]
-        (signal! other {:kind :link :from me :reason reason :checked true})))
+    (doseq [other links]
+      (proc/-signal other me :link reason true))
     (doseq [[_ notify] mons] (notify reason))))
 
-(defn- new-actor [pid]
+(defn- new-actor [pid node]
   (with-meta
     {::pid pid
+     ::node node
      ::saved (atom [])
      ::inbox (atom empty-queue)
      ::signals (atom [])
@@ -426,16 +487,16 @@
   immediate crash cannot slip past it."
   ([f] (spawn f {}))
   ([f {:keys [name link trap] :as opts}]
-   (let [me (new-actor (swap! counter inc))
-         parent (self)
+   (let [parent (self)
+         me (new-actor (swap! counter inc) (node))
          go (promise)]
      (when trap (reset! (::trapping me) true))
      (reset! (::state me) (:state opts))
      (when name (register! name me))
      (swap! procs assoc (::pid me) me)
      (when (and link parent)
-       (swap! (::links me) conj (::pid parent))
-       (swap! (::links parent) (fn [ls] (if (open? ls) (conj ls (::pid me)) ls))))
+       (swap! (::links me) conj parent)
+       (swap! (::links parent) (fn [ls] (if (open? ls) (conj ls me) ls))))
      (deliver
       (::fiber me)
       (fib/spawn
@@ -665,3 +726,39 @@
                 (set-state! (handler (state) msg))
                 (recur))))
           (assoc opts :state init))))
+
+;; the Process protocol for local actors ------------------------------------
+
+(extend-protocol proc/Process
+  clojure.lang.IPersistentMap
+  (-pid [a] (::pid a))
+  (-node [a] (::node a))
+  (-alive? [a] (alive? a))
+  (-deliver [a msg] (enqueue! a msg))
+  (-signal [a from kind reason checked]
+    (signal! a {:kind kind :from from :reason reason :checked checked}))
+  (-link [a from]
+    (let [[before _] (swap-vals! (::links a) (fn [ls] (if (open? ls) (conj ls from) ls)))]
+      (open? before)))
+  (-unlink [a from]
+    (swap! (::links a) (fn [ls] (if (open? ls) (disj ls from) ls))))
+  (-add-monitor [a ref notify] (add-monitor! a ref notify))
+  (-drop-monitor [a ref] (drop-monitor! a ref)))
+
+(defn local-actor
+  "The live local actor with id pid, or nil: how a node finds the process
+  a frame from another node names."
+  [pid]
+  (get @procs pid))
+
+(defn remote-links
+  "[actor handle] for each link from a live local actor of node n to a
+  process of another node: what a lost connection breaks."
+  [n]
+  (vec (for [[_ a] @procs
+             :when (= n (::node a))
+             :let [ls @(::links a)]
+             :when (open? ls)
+             h ls
+             :when (remote? h)]
+         [a h])))

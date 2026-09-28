@@ -196,9 +196,23 @@ there is none), and `delete-handler!` returns what `h-terminate` returned.
   if it hasn't exited after its `:shutdown` time.
 - More than `:intensity` restarts in `:period` seconds (defaults 1 and 5, as
   in OTP) and the supervisor stops its children and exits with `:shutdown`.
+- Flags and child specs are checked as `supervisor:check_childspecs`
+  does, and a bad one is refused with OTP's reason: `start` throws
+  `{:reason [:supervisor-data r]}` or `[:start-spec r]`, and
+  `start-child!` returns `[:error r]`. `get-childspec` returns a spec
+  with its defaults filled in.
+- `:simple-one-for-one` takes one spec as a template, and each
+  `(start-child! sup args)` starts a child from it with `args` appended to
+  its start fn's arguments. These children have no ids: they are
+  terminated by pid, cannot be restarted or deleted by id, and are
+  restarted alone.
+- A child may be `:significant`. With `:auto-shutdown :any-significant`
+  the supervisor shuts down when any significant child ends without being
+  restarted. With `:all-significant` it shuts down when the last one ends.
 - The API is `start-child!`, `terminate-child!`, `restart-child!`,
-  `delete-child!`, `which-children`, `count-children`, `child` and `stop!`.
-  Supervisors nest through `start-link` and `:type :supervisor`.
+  `delete-child!`, `which-children`, `count-children`, `get-childspec`,
+  `child` and `stop!`. Supervisors nest through `start-link` and
+  `:type :supervisor`.
 
 ## Applications
 
@@ -212,6 +226,48 @@ If the tree exits on its own, the type decides what happens next. A
 or a `:transient` one that exited abnormally, stops every other application,
 where OTP would stop the node.
 
+## Distribution
+
+A process handle is anything that implements `ensemble.process/Process`:
+deliver a message, send an exit signal, link, unlink, monitor, demonitor.
+Local actors implement it directly. A pid on another node is an
+`ensemble.node/RemotePid`, which sends each operation as a frame to its
+node. `!`, `link!`, `monitor!`, `exit!`, gen_server calls and supervisors
+work unchanged whether the other process is in this VM, in another OS
+process or on another machine.
+
+```clojure
+(require '[ensemble.node :as node])
+
+(node/start! :shop.a (node/loopback))
+(node/start! :shop.b (node/loopback))
+
+(node/with-node :shop.a
+  (let [p (node/spawn-on :shop.b `my.ns/worker [] {:link true})]
+    (act/! p [:job 1])                          ; by pid
+    (act/! [:At :registry :shop.b] [:hello])    ; {Name, Node}
+    (gs/call! [:At :counter :shop.b] [:get])))
+```
+
+- A pid names its node. Pids inside a message cross as data and arrive as
+  pids again: a node's own pid as its local process, any other as a
+  `RemotePid`.
+- Nodes connect on first contact. `connect!`, `disconnect!` and
+  `connected` manage connections explicitly.
+- When a connection is lost, links across it break with `:noconnection`,
+  monitors across it fire `[:DOWN ref :process pid :noconnection]`, and
+  each `monitor-node!` gets `[:nodedown node]`. A link to a remote pid
+  that is gone gives `:noproc`.
+- `spawn-on` starts a fn named by a symbol on the other node, as
+  `spawn(Node, M, F, A)` does.
+- Connections come from a `Transport`. The loopback transport joins nodes
+  in one VM, but each frame is still printed and read back as EDN, so what
+  crosses is exactly what a wire would carry. A socket transport plugs in
+  through the same protocol.
+- A node name is a keyword that reads back as itself, like `:shop.host`.
+  Erlang's `shop@host` doesn't work here: `@` ends a token in Clojure's
+  reader, and edn rejects it.
+
 ## Where this differs from Erlang
 
 - **Exit signals land wherever the process is**, through jolt's fiber
@@ -220,7 +276,8 @@ where OTP would stop the node.
   it catches still kills it at its next receive. The bookkeeping of a dying
   process -- telling its links and monitors -- runs masked, so a late
   signal cannot tear it.
-- **No distribution**, no hot code loading, no `sys` suspend/resume, and no
+- **Distribution has only the loopback transport so far**, with no
+  cookies and no global name registry. There is also no hot code loading, no `sys` suspend/resume, and no
   reductions (jolt preempts fibers on a timer instead).
 - **Reasons** are any value, and a crash's reason is the throwable itself
   rather than `{Exception, Stacktrace}`.
@@ -236,17 +293,22 @@ written from the Erlang/OTP documentation:
 |---|---|---|
 | `ensemble.signal` | what an exit signal does to a process | `signal_spec` |
 | `ensemble.select`, `ensemble.match`, `ensemble.pattern` | which message a receive takes, how a pattern binds | `select_spec`, `match_spec`, `pattern_spec` |
-| `ensemble.order` | restart types, strategy plans, restart intensity | `order_spec` |
+| `ensemble.order` | restart types, strategy plans, restart intensity, auto-shutdown | `order_spec` |
+| `ensemble.childspec` | which supervisor flags and child specs are valid, with their defaults | `childspec_spec` |
+| `ensemble.dist` | where a send goes, what a pid in a message is on arrival, what a lost connection does | `dist_spec` |
 | `ensemble.callback` | what a gen_server callback's return means | `callback_spec` |
 | `ensemble.statem` | gen_statem results, actions, postpone order, timeouts | `statem_spec` |
 
-Every spec requires proof (`{:require :proved}`): 176 of their 181 laws
-are proved, 92 of them for every input -- among them that a selective
+Every spec requires proof (`{:require :proved}`): 226 of their 236 laws
+are proved, 130 of them for every input -- among them that a selective
 receive is the manual's, message by message and clause by clause, that a
-restart plan is the supervisor docs', and that no gen_statem event is lost
-or duplicated, over mailboxes, children and queues of any length. The 5
-left to testing each say why: they recurse over patterns of any depth, or
-over a callback's list of actions. `test/ensemble/order_proof.clj` holds
+restart plan is the supervisor docs', that a child spec is refused for
+the reason `check_childspecs` gives, that a lost connection breaks exactly
+the links and monitors across it, and that no gen_statem event is lost
+or duplicated, over mailboxes, children and queues of any length. The 10
+left to testing each say why: they recurse over patterns of any depth,
+over a callback's list of actions, or walk a message of any shape for the
+pids in it. `test/ensemble/order_proof.clj` holds
 the lemmas about clojure.core the supervisor's proofs cite.
 
 A law over `Any` covers values without NaN; one over `Any!` takes NaN in
@@ -258,8 +320,10 @@ spec states both.
 
 Each spec also states, with `calls`, that the effectful runtime goes through
 these fns. For example, `ensemble.actor/handle-signal!` must reach
-`ensemble.signal/on-signal`, and the supervisor must decide restarts through
-`ensemble.order`. The laws therefore constrain the code that actually runs, not
+`ensemble.signal/on-signal`, the supervisor must decide restarts through
+`ensemble.order` and validate specs through `ensemble.childspec`, and every
+operation `ensemble.node` sends to a remote pid must go through
+`ensemble.dist/route`. The laws therefore constrain the code that actually runs, not
 a model beside it. The concurrent behaviour itself (races, delivery, timing)
 is covered by the tests in `test/ensemble/*_test.clj`.
 

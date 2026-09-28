@@ -1,17 +1,17 @@
 (ns ensemble.runner
   "Runs ensemble's writ specs and behaviour tests.
 
-  Specs are the files under test/ensemble named *_spec.clj: each is checked
-  with writ.spec/check, which runs the static, law and proof gates.  Behaviour
-  tests are the *_test.clj files, run under clojure.test -- the actor layer is
-  effectful (it spawns fibers and blocks on channels), so it is exercised here
-  rather than by a law.
+  Specs are the files under test/ensemble named *_spec.clj: each defines a
+  clojure.test test, writ-check, that runs writ.spec/check -- the static,
+  law and proof gates -- and fails with its report.  Behaviour tests are the
+  *_test.clj files -- the actor layer is effectful (it spawns fibers and
+  blocks on channels), so it is exercised there rather than by a law.  Both
+  run under clojure.test.
 
   Discovery is by directory scan, so adding a spec or test file is enough."
   (:require [clojure.test :as t]
             [clojure.string :as str]
-            [jolt.fs :as fs]
-            [writ.spec :as spec]))
+            [jolt.fs :as fs]))
 
 (defn- path->ns
   "test/ensemble/foo_spec.clj -> ensemble.foo-spec."
@@ -27,21 +27,6 @@
   (->> (fs/list-dir "test/ensemble" suffix)
        (map path->ns)
        sort))
-
-(defn- run-specs [nses]
-  (reduce
-   (fn [acc n]
-     (print (str "  spec " n " ... ")) (flush)
-     (let [r (spec/check n)
-           ok (:ok r)]
-       (println (if ok "ok" "FAIL"))
-       (when-not ok
-         (println "    " (:message r))
-         (when (seq (:gaps r)) (println "    gaps:" (:gaps r)))
-         (when (seq (:rejected r)) (println "    rejected:" (:rejected r))))
-       (if ok acc (inc acc))))
-   0
-   nses))
 
 (defn- run-tests [nses]
   (doseq [n nses] (require n))
@@ -60,11 +45,10 @@
 (defn -main [& _]
   (let [specs (discovered "*_spec.clj")
         tests (discovered "*_test.clj")
-        bad-specs (run-specs specs)
         {:keys [test pass fail error] :or {test 0 pass 0 fail 0 error 0}}
-        (run-tests tests)]
-    (println (str "\nSpecs: " (count specs) ", failing " bad-specs "."))
+        (run-tests (concat specs tests))]
+    (println (str "\nSpecs: " (count specs) ", tests: " (count tests) " namespaces."))
     (println (str "Ran " test " tests. " pass " assertions passed, "
                   fail " failures, " error " errors."))
     (flush)
-    (System/exit (if (pos? (+ bad-specs fail error)) 1 0))))
+    (System/exit (if (pos? (+ fail error)) 1 0))))

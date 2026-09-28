@@ -89,6 +89,12 @@
      (cond
        (= target (act/self)) (throw (failure :calling-self request))
        (act/self)            (call-from-actor target request timeout-ms)
+       ;; a reply from another node comes to an actor's alias: a promise
+       ;; cannot cross, so a short-lived actor makes the call
+       (act/remote? target)  (let [p (promise)]
+                               (act/spawn (fn [] (deliver p (try [:ok (call-from-actor target request timeout-ms)]
+                                                                 (catch Throwable e [:err e])))))
+                               (let [[k v] @p] (if (= :ok k) v (throw v))))
        :else                 (call-from-outside target request timeout-ms)))))
 
 (defn cast!

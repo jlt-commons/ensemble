@@ -3,8 +3,7 @@
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps  {io.github.jlt-commons/writ
-                       {:git/url "https://github.com/jlt-commons/writ"
-                        :git/sha "01a009ea715c976cc155355649c5188b6c363743"}}
+                       {:local/root "../writ"}}
          :main-opts   ["-m" "ensemble.runner"]}
   :bench {:extra-paths ["bench"]
           :main-opts   ["-m" "ensemble.bench"]}}}
