@@ -1,35 +1,55 @@
 (ns ensemble.application-test
-  (:require [clojure.test :refer [deftest is]]
-            [ensemble.actor :as act]
+  (:require [clojure.core.async :as a]
+            [clojure.test :refer [deftest is]]
+            [ensemble.actor :as act :refer [receive]]
             [ensemble.application :as app]
             [ensemble.supervisor :as sup]))
 
-(deftest start-then-stop-runs-the-lifecycle
-  (let [log (atom [])
-        a {:name ::demo
-           :start (fn [] (swap! log conj :start) :state)
-           :stop  (fn [state] (swap! log conj [:stop state]))}]
-    (is (= ::demo (app/start-application a)))
-    (is (app/started? ::demo))
-    (is (= [:start] @log))
-    (is (= ::demo (app/stop-application ::demo)))
-    (is (not (app/started? ::demo)))
-    (is (= [:start [:stop :state]] @log))))
+(defn- eventually [pred]
+  (loop [i 0] (cond (pred) true (> i 200) false :else (do (a/<!! (a/timeout 10)) (recur (inc i))))))
 
-(deftest starting-an-already-started-application-throws
-  (let [a {:name ::once :start (fn [] :s) :stop (fn [_] nil)}]
-    (app/start-application a)
-    (is (thrown? Exception (app/start-application a)))
-    (app/stop-application ::once)))
+(defn- worker [] (act/spawn-link (fn [] (receive [:die (act/exit! :boom)]))))
 
-(deftest stopping-an-unknown-application-is-a-no-op
-  (is (nil? (app/stop-application ::missing))))
+(defn- tree [] (sup/start {:intensity 0} [{:id :w :start worker}]))
 
-(deftest stopping-an-application-stops-its-supervisor
-  (let [sup (atom nil)
-        a {:name ::tree
-           :start (fn [] (reset! sup (sup/start-supervisor {})))
-           :stop  (fn [s] (sup/stop-supervisor! s))}]
-    (app/start-application a)
-    (app/stop-application ::tree)
-    (is (act/done? @sup))))
+(defn- spec [name & {:as more}]
+  (merge {:name name :start (fn [] [(tree) name])} more))
+
+(deftest start-and-stop-run-the-lifecycle
+  (let [log (atom [])]
+    (app/load! (spec ::a :stop (fn [st] (swap! log conj [:stop st]))))
+    (is (= :ok (app/start! ::a)))
+    (is (app/started? ::a))
+    (is (thrown? Throwable (app/start! ::a)))
+    (let [top (:top (get @@#'app/running ::a))]
+      (is (= :ok (app/stop! ::a)))
+      (is (false? (act/alive? top))))
+    (is (= [[:stop ::a]] @log))
+    (is (nil? (app/stop! ::a)))))
+
+(deftest dependencies-must-be-running
+  (app/load! (spec ::base))
+  (app/load! (spec ::top :applications [::base]))
+  (is (= [:not-started ::base] (try (app/start! ::top) (catch Throwable e (:reason (ex-data e))))))
+  (is (= [::base ::top] (app/ensure-all-started! ::top)))
+  (is (= [] (app/ensure-all-started! ::top)))
+  (app/stop! ::top) (app/stop! ::base))
+
+(deftest a-temporary-app-whose-tree-dies-is-only-reported
+  (app/load! (spec ::temp))
+  (app/load! (spec ::bystander))
+  (app/start! ::temp) (app/start! ::bystander)
+  (let [top (:top (get @@#'app/running ::temp))]
+    (act/! (sup/child top :w) :die)
+    (is (eventually #(not (app/started? ::temp))))
+    (is (some #(= ::temp (first %)) (app/exits)))
+    (is (app/started? ::bystander)))
+  (app/stop! ::bystander))
+
+(deftest a-permanent-app-whose-tree-dies-stops-everything
+  (app/load! (spec ::perm :type :permanent))
+  (app/load! (spec ::victim))
+  (app/start! ::victim) (app/start! ::perm)
+  (let [top (:top (get @@#'app/running ::perm))]
+    (act/! (sup/child top :w) :die)
+    (is (eventually #(not (app/started? ::victim))))))

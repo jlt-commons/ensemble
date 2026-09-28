@@ -18,8 +18,18 @@
       [:Cons p q]    matches a non-empty sequential message whose first
                      element matches p and rest matches q
 
+  As in Erlang, a name bound twice in one pattern must match equal values:
+  [x x] matches [1 1] but not [1 2].
+
   capture returns the bindings it captured as a map, or nil when the pattern
   does not match.")
+
+(defn- agree
+  "b and c merged, or nil when they bind a name to different values."
+  [b c]
+  (when (every? (fn [k] (or (not (contains? b k)) (= (get b k) (get c k))))
+                (keys c))
+    (merge b c)))
 
 (defn capture
   "Match compiled pattern p against message m.  Return a bindings map (empty
@@ -32,9 +42,10 @@
     :Bind {(nth p 1) m}
     :Cons (let [[_ hd tl] p]
             (if (and (sequential? m) (seq m))
-              (let [b (capture hd (first m))
-                    c (capture tl (rest m))]
-                (if (or (nil? b) (nil? c))
+              ;; the tail is only tried once the head matches
+              (let [b (capture hd (first m))]
+                (if (nil? b)
                   nil
-                  (merge b c)))
+                  (let [c (capture tl (rest m))]
+                    (if (nil? c) nil (agree b c)))))
               nil))))

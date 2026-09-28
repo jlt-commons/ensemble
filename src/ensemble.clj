@@ -1,106 +1,60 @@
 (ns ensemble
-  "Public API for ensemble: Erlang-style actors, the OTP behaviours and
-  supervisors, all on jolt fibers.
+  "Erlang processes and OTP behaviours on jolt fibers.
 
-  Everything here is a thin re-export so a caller can require one namespace:
+  This namespace re-exports the process primitives and the client side of
+  the gen protocol (call!, cast!, reply!, stop!), which every behaviour
+  speaks.  Each behaviour is used through its own namespace, as OTP's are
+  modules, since they share names such as start and start-link:
 
-      (require '[ensemble :as e])
+      ensemble.actor        processes: spawn, !, receive, links, monitors
+      ensemble.gen-server   gen_server
+      ensemble.gen-statem   gen_statem
+      ensemble.gen-event    gen_event
+      ensemble.supervisor   supervisor
+      ensemble.application  applications
 
-      (def a (e/spawn (fn [] (e/receive [[:ping from] (e/! from :pong)]))))
-
-  The layers are also usable directly:
-
-      ensemble.actor       actors: spawn, send, selective receive
-      ensemble.gen-server  gen_server behaviour: call/cast/info/timeout
-      ensemble.gen-event   gen_event behaviour: manager + handlers
-      ensemble.gen-fsm     gen_fsm behaviour: named states + events
-      ensemble.supervisor  supervision trees: restart strategies
-      ensemble.application OTP applications: named start/stop
-
-  Patterns in receive are the compiled forms of ensemble.pattern: a symbol
-  binds the whole message, _ matches anything, literals match themselves, and
-  a vector pattern matches a message element by element."
+  The decisions these make are pure namespaces with writ contracts:
+  ensemble.signal (exit signals), ensemble.select (selective receive),
+  ensemble.order (supervision), ensemble.callback (gen_server returns) and
+  ensemble.statem (gen_statem transitions)."
   (:require [ensemble.actor :as act]
-            [ensemble.gen-server :as gs]
-            [ensemble.gen-event :as ge]
-            [ensemble.gen-fsm :as gf]
-            [ensemble.supervisor :as sup]
-            [ensemble.application :as app]))
+            [ensemble.gen-server :as gs]))
 
-;; actors ---------------------------------------------------------------
+;; processes ------------------------------------------------------------
 
 (def spawn act/spawn)
-(def ! act/!)
-(def !! act/!!)
-(def receive-match act/receive-match)
-(def receive-timed act/receive-timed)
+(def spawn-link act/spawn-link)
+(def spawn-monitor act/spawn-monitor)
+(def spawn-actor act/spawn-actor)
 (def self act/self)
-(def join act/join)
+(def ! act/!)
+(def receive-match act/receive-match)
+(def make-ref act/make-ref)
 (def state act/state)
 (def set-state! act/set-state!)
-(def done? act/done?)
+(def update-state! act/update-state!)
+(def alive? act/alive?)
 (def register! act/register!)
-(def whereis act/whereis)
 (def unregister! act/unregister!)
-(def vref act/vref)
-(def maketag act/maketag)
-(def mailbox-of act/mailbox-of)
-(def watch! act/watch!)
-(def unwatch! act/unwatch!)
+(def whereis act/whereis)
+(def registered act/registered)
 (def link! act/link!)
 (def unlink! act/unlink!)
 (def trap-exit! act/trap-exit!)
 (def exit! act/exit!)
+(def monitor! act/monitor!)
+(def demonitor! act/demonitor!)
+(def join act/join)
+(def exit-reason act/exit-reason)
 
 (defmacro receive
   "Selective receive over the current actor's mailbox.  See ensemble.actor."
   [& clauses]
   `(act/receive ~@clauses))
 
-;; gen_server -----------------------------------------------------------
+;; the gen protocol -------------------------------------------------------
 
-(def gen-server gs/gen-server)
-(def reply! gs/reply!)
-(def reply-error! gs/reply-error!)
 (def call! gs/call!)
-(def call-timed! gs/call-timed!)
 (def cast! gs/cast!)
-(def shutdown! gs/shutdown!)
-
-;; gen_event ------------------------------------------------------------
-
-(def start-manager ge/start-manager)
-(def add-handler! ge/add-handler!)
-(def remove-handler! ge/remove-handler!)
-(def notify ge/notify)
-(def sync-notify! ge/sync-notify!)
-(def call-handler! ge/call-handler!)
-
-;; gen_fsm --------------------------------------------------------------
-
-(def start-fsm gf/start-fsm)
-(def send-event! gf/send-event!)
-(def sync-send-event! gf/sync-send-event!)
-
-;; supervisor -----------------------------------------------------------
-
-(def start-supervisor sup/start-supervisor)
-(def start-child! sup/start-child!)
-(def terminate-child! sup/terminate-child!)
-(def get-child sup/get-child)
-(def remove-child! sup/remove-child!)
-(def remove-and-terminate-child! sup/remove-and-terminate-child!)
-(def which-children! sup/which-children!)
-(def stop-supervisor! sup/stop-supervisor!)
-
-;; applications ---------------------------------------------------------
-
-(def start-application app/start-application)
-(def stop-application app/stop-application)
-(def started? app/started?)
-
-;; behaviours (implement these on a record) -----------------------------
-
-(def Server gs/Server)
-(def Handler ge/Handler)
-(def FSM gf/FSM)
+(def reply! gs/reply!)
+(def stop! gs/stop!)

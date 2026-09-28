@@ -3,7 +3,7 @@
   a message either fails (nil) or yields the bindings it captured."
   (:require [writ.spec :refer [spec data ann refine graph law]]))
 
-(spec ensemble.match)
+(spec ensemble.match {:require :proved})
 
 (data Pattern
   Wild
@@ -31,7 +31,9 @@
    :edges  {:wild  {[capture Any] #{:matched}}
             :bind  {[capture Any] #{:matched}}
             :lit   {[capture Any] #{:outcome}}
-            :tuple {[capture Any] #{:outcome}}}})
+            :tuple {[capture Any] #{:outcome}}}
+   :tested {:lit "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"
+            :tuple "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"}})
 
 (def two-tuple [:Cons [:Wild] [:Nil]])
 (def bind-pair [:Cons [:Bind 'l] [:Cons [:Bind 'r] [:Nil]]])
@@ -45,6 +47,7 @@
     (=> (= p [:Wild]) (= (capture p m) {}))))
 
 (law nil-matches-only-empty
+  {:require :tested :because "a vector of unknown length needs induction"}
   (forall [xs (Vec Any)] (= (capture [:Nil] xs) (if (empty? xs) {} nil))))
 
 (law lit-matches-itself
@@ -73,3 +76,16 @@
   (forall [a Any, b Any, k Keyword]
     (=> (not= k :pair)
         (nil? (capture tagged-pair [k a b])))))
+
+;; --- a name bound twice must match equal values (Erlang's rule) ----------
+
+(def twice [:Cons [:Bind 'x] [:Cons [:Bind 'x] [:Nil]]])
+
+(law a-repeated-name-matches-equal-elements
+  (forall [a Any] (= (capture twice [a a]) {'x a})))
+
+(law a-repeated-name-rejects-different-elements
+  (forall [a Any, b Any] (=> (not= a b) (nil? (capture twice [a b])))))
+
+(law distinct-names-bind-independently
+  (forall [a Any, b Any] (= (capture bind-pair [a b]) {'l a 'r b})))

@@ -1,200 +1,233 @@
 (ns ensemble.supervisor-test
   (:require [clojure.core.async :as a]
             [clojure.test :refer [deftest is]]
-            [ensemble.actor :as act]
+            [ensemble.actor :as act :refer [receive]]
             [ensemble.gen-server :as gs]
             [ensemble.supervisor :as sup]))
 
+(defn- sleep [ms] (a/<!! (a/timeout ms)))
+
 (defn- eventually
-  "Poll pred for up to ~2s, parking the fiber between checks."
+  "Poll pred for up to ~2s."
   [pred]
   (loop [i 0]
     (cond
       (pred) true
       (> i 200) false
-      :else (do (a/<!! (a/timeout 10)) (recur (inc i))))))
+      :else (do (sleep 10) (recur (inc i))))))
 
-(defn- boom
-  "A child start fn: bump started, then die abnormally on any message."
-  [started kill]
-  (fn []
-    (swap! started inc)
-    (let [x (act/spawn (fn [] (act/receive [_ (throw (ex-info "child died" {}))])))]
-      (reset! kill x)
-      x)))
+(defn- worker
+  "A child start fn: log [:start id], then run until told.  :die exits
+  abnormally, :quit normally.  Traps exits when trap?, logging the shutdown."
+  ([log id] (worker log id false))
+  ([log id trap?]
+   (fn []
+     (swap! log conj [:start id])
+     (act/spawn-link
+      (fn []
+        (when trap? (act/trap-exit!))
+        (loop []
+          (receive
+           [:die (act/exit! :boom)]
+           [:quit :ok]
+           [[:EXIT _ r] (do (swap! log conj [:stop id r]) (act/exit! r))]
+           [_ (recur)])))))))
 
-(defn- quiet
-  "A child start fn: bump started, then return normally on any message."
-  [started kill]
-  (fn []
-    (swap! started inc)
-    (let [x (act/spawn (fn [] (act/receive [_ :ok])))]
-      (reset! kill x)
-      x)))
+(defn- starts [log id] (count (filter #(= [:start id] %) @log)))
 
-(deftest one-for-one-restarts-only-failed-child
-  (let [a (atom 0) b (atom 0) kill-a (atom nil)
-        sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 5})]
-    (is (= :a (sup/start-child! sup :a {:start (boom a kill-a)})))
-    (sup/start-child! sup :b {:start (boom b (atom nil))})
-    (is (= 1 @a))
-    (is (= 1 @b))
-    (act/! @kill-a :die)
-    (is (eventually (fn [] (= 2 @a))))
-    (is (= 1 @b))
-    (is (= [:a :b] (sup/which-children! sup)))))
+(defn- ids [s] (mapv :id (sup/which-children s)))
 
-(deftest one-for-all-restarts-every-child
-  (let [a (atom 0) b (atom 0) kill-a (atom nil)
-        sup (sup/start-supervisor {:strategy :one-for-all :max-restarts 5})]
-    (sup/start-child! sup :a {:start (boom a kill-a)})
-    (sup/start-child! sup :b {:start (boom b (atom nil))})
-    (act/! @kill-a :die)
-    (is (eventually (fn [] (= 2 @a))))
-    (is (eventually (fn [] (= 2 @b))))))
-
-(deftest rest-for-one-restarts-failed-and-later
-  (let [a (atom 0) b (atom 0) c (atom 0) kill-b (atom nil)
-        sup (sup/start-supervisor {:strategy :rest-for-one :max-restarts 5})]
-    (sup/start-child! sup :a {:start (boom a (atom nil))})
-    (sup/start-child! sup :b {:start (boom b kill-b)})
-    (sup/start-child! sup :c {:start (boom c (atom nil))})
-    (act/! @kill-b :die)
-    (is (eventually (fn [] (= 2 @b))))
-    (is (eventually (fn [] (= 2 @c))))
-    (is (= 1 @a))))
-
-(deftest restart-intensity-shuts-supervisor-down
-  (let [a (atom 0) kill (atom nil)
-        sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 2 :max-seconds 60})]
-    (sup/start-child! sup :a {:start (boom a kill)})
-    (act/! @kill :die)
-    (is (eventually (fn [] (= 2 @a))))
-    (act/! @kill :die)
-    (is (eventually (fn [] (= 3 @a))))
-    (act/! @kill :die)
-    (is (eventually (fn [] (act/done? sup))))
-    (is (= 3 @a))))
-
-(deftest transient-child-survives-its-normal-exit
-  (let [a (atom 0) kill (atom nil)
-        sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 5})]
-    (sup/start-child! sup :a {:start (quiet a kill) :restart :transient})
-    (act/! @kill :bye)
-    (is (eventually (fn [] (empty? (sup/which-children! sup)))))
-    (is (= 1 @a))))
-
-(deftest transient-child-restarted-on-abnormal-exit
-  (let [a (atom 0) kill (atom nil)
-        sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 5})]
-    (sup/start-child! sup :a {:start (boom a kill) :restart :transient})
-    (act/! @kill :die)
-    (is (eventually (fn [] (= 2 @a))))))
-
-(deftest temporary-child-never-restarted
-  (let [a (atom 0) kill (atom nil)
-        sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 5})]
-    (sup/start-child! sup :a {:start (boom a kill) :restart :temporary})
-    (act/! @kill :die)
-    (is (eventually (fn [] (empty? (sup/which-children! sup)))))
-    (is (= 1 @a))))
-
-(deftest terminate-child-untracks-it
-  (let [a (atom 0)
-        sup (sup/start-supervisor {})]
-    (sup/start-child! sup :a {:start (quiet a (atom nil))})
-    (is (= [:a] (sup/which-children! sup)))
-    (sup/terminate-child! sup :a)
-    (is (= [] (sup/which-children! sup)))))
-
-(defrecord Rester []
-  gs/Server
-  (init [_] nil)
-  (handle-call [_ _from _msg st] [:reply :ok st])
-  (handle-cast [_ _msg st] [:noreply st])
-  (handle-info [_ _msg st] [:noreply st])
-  (handle-timeout [_ st] [:noreply st])
-  (terminate [_ _reason _st] nil))
-
-(deftest get-child-returns-the-actor
-  (let [a (atom 0)
-        sup (sup/start-supervisor {})]
-    (sup/start-child! sup :a {:start (quiet a (atom nil))})
-    (is (some? (sup/get-child sup :a)))
-    (is (nil? (sup/get-child sup :missing)))))
-
-(deftest remove-child-untracks-without-stopping-it
-  (let [a (atom 0) kill (atom nil)
-        sup (sup/start-supervisor {})]
-    (sup/start-child! sup :a {:start (quiet a kill)})
-    (sup/remove-child! sup :a)
-    (is (= [] (sup/which-children! sup)))
-    (is (false? (act/done? @kill)))
-    (act/! @kill :bye)
-    (is (= :ok (act/join @kill)))))
-
-(deftest remove-and-terminate-child-stops-the-child
-  (let [sup (sup/start-supervisor {})]
-    (sup/start-child! sup :a {:start (fn [] (gs/gen-server (->Rester)))})
-    (let [child (sup/get-child sup :a)]
-      (sup/remove-and-terminate-child! sup :a)
-      (is (= [] (sup/which-children! sup)))
-      (is (eventually (fn [] (act/done? child)))))))
-
-(deftest init-time-children
-  (let [a (atom 0)
-        sup (sup/start-supervisor {:children [{:id :a :start (quiet a (atom nil))}]})]
-    (is (= [:a] (sup/which-children! sup)))
-    (is (= 1 @a))))
-
-(defn- tracked
-  "A child start fn: append id to log, then wait for a message.  :die kills it
-  so a restart, and the order the children restart in, can be observed."
-  [log id]
-  (fn []
-    (swap! log conj id)
-    (act/spawn (fn [] (act/receive [:die (throw (ex-info "child died" {}))]
-                                   [[:ensemble/shutdown _] :ok]
-                                   [_ :ok])))))
-
-(deftest one-for-all-restarts-in-start-order
+(deftest children-start-in-order
   (let [log (atom [])
-        sup (sup/start-supervisor {:strategy :one-for-all :max-restarts 5})]
-    (sup/start-child! sup :a {:start (tracked log :a)})
-    (sup/start-child! sup :b {:start (tracked log :b)})
-    (sup/start-child! sup :c {:start (tracked log :c)})
-    (is (= [:a :b :c] @log))
-    (act/! (sup/get-child sup :b) :die)
-    (is (eventually (fn [] (= [:a :b :c :a :b :c] @log))))))
+        s (sup/start {} [{:id :a :start (worker log :a)}
+                         {:id :b :start (worker log :b)}])]
+    (is (= [[:start :a] [:start :b]] @log))
+    (is (= [:a :b] (ids s)))
+    (sup/stop! s)))
+
+(deftest one-for-one-restarts-only-the-failed-child
+  (let [log (atom [])
+        s (sup/start {:intensity 5} [{:id :a :start (worker log :a)}
+                                     {:id :b :start (worker log :b)}])
+        b (sup/child s :b)]
+    (act/! (sup/child s :a) :die)
+    (is (eventually #(= 2 (starts log :a))))
+    (is (= 1 (starts log :b)))
+    (is (= b (sup/child s :b)))
+    (sup/stop! s)))
+
+(deftest one-for-all-stops-the-others-in-reverse-then-restarts-in-order
+  (let [log (atom [])
+        s (sup/start {:strategy :one-for-all :intensity 5}
+                     [{:id :a :start (worker log :a true)}
+                      {:id :b :start (worker log :b true)}
+                      {:id :c :start (worker log :c true)}])
+        old-c (sup/child s :c)]
+    (reset! log [])
+    (act/! (sup/child s :b) :die)
+    (is (eventually #(= 5 (count @log))))
+    (is (= [[:stop :c :shutdown] [:stop :a :shutdown]
+            [:start :a] [:start :b] [:start :c]]
+           @log))
+    (is (false? (act/alive? old-c)))
+    (sup/stop! s)))
+
+(deftest rest-for-one-restarts-the-failed-and-later
+  (let [log (atom [])
+        s (sup/start {:strategy :rest-for-one :intensity 5}
+                     [{:id :a :start (worker log :a)}
+                      {:id :b :start (worker log :b)}
+                      {:id :c :start (worker log :c)}])
+        old-c (sup/child s :c)]
+    (act/! (sup/child s :b) :die)
+    (is (eventually #(and (= 2 (starts log :b)) (= 2 (starts log :c)))))
+    (is (= 1 (starts log :a)))
+    (is (= :shutdown (act/exit-reason old-c 1000)))
+    (sup/stop! s)))
+
+(deftest exceeding-the-intensity-shuts-the-supervisor-down
+  (let [log (atom [])
+        s (sup/start {:intensity 2 :period 60} [{:id :a :start (worker log :a)}])]
+    (act/! (sup/child s :a) :die)
+    (is (eventually #(= 2 (starts log :a))))
+    (act/! (sup/child s :a) :die)
+    (is (eventually #(= 3 (starts log :a))))
+    (let [last-child (sup/child s :a)]
+      (act/! last-child :die)
+      (is (= :shutdown (act/exit-reason s 1000))))
+    (is (= 3 (starts log :a)))))
+
+(deftest the-default-intensity-is-one-in-five-seconds
+  (let [log (atom [])
+        s (sup/start {} [{:id :a :start (worker log :a)}])]
+    (act/! (sup/child s :a) :die)
+    (is (eventually #(= 2 (starts log :a))))
+    (act/! (sup/child s :a) :die)
+    (is (= :shutdown (act/exit-reason s 1000)))))
+
+(deftest transient-children-restart-only-on-abnormal-exit
+  (let [log (atom [])
+        s (sup/start {:intensity 5} [{:id :a :start (worker log :a) :restart :transient}])]
+    (act/! (sup/child s :a) :die)
+    (is (eventually #(= 2 (starts log :a))))
+    (act/! (sup/child s :a) :quit)
+    (is (eventually #(nil? (sup/child s :a))))
+    (is (= [:a] (ids s)))
+    (is (= 2 (starts log :a)))
+    (sup/stop! s)))
+
+(deftest temporary-children-are-never-restarted-and-are-dropped
+  (let [log (atom [])
+        s (sup/start {:intensity 5} [{:id :a :start (worker log :a) :restart :temporary}])]
+    (act/! (sup/child s :a) :die)
+    (is (eventually #(empty? (ids s))))
+    (is (= 1 (starts log :a)))
+    (sup/stop! s)))
+
+(deftest permanent-children-restart-even-on-a-normal-exit
+  (let [log (atom [])
+        s (sup/start {:intensity 5} [{:id :a :start (worker log :a)}])]
+    (act/! (sup/child s :a) :quit)
+    (is (eventually #(= 2 (starts log :a))))
+    (sup/stop! s)))
+
+(deftest a-temporary-sibling-is-stopped-but-not-restarted
+  (let [log (atom [])
+        s (sup/start {:strategy :one-for-all :intensity 5}
+                     [{:id :a :start (worker log :a)}
+                      {:id :t :start (worker log :t) :restart :temporary}])]
+    (act/! (sup/child s :a) :die)
+    (is (eventually #(= 2 (starts log :a))))
+    (is (= [:a] (ids s)))
+    (sup/stop! s)))
+
+(deftest terminate-restart-and-delete-a-child
+  (let [log (atom [])
+        s (sup/start {} [{:id :a :start (worker log :a true)}])
+        a1 (sup/child s :a)]
+    (is (= :ok (sup/terminate-child! s :a)))
+    (is (= :shutdown (act/exit-reason a1 1000)))
+    (is (some #{[:stop :a :shutdown]} @log))
+    (is (= [{:id :a :actor nil :type :worker :restart :permanent}] (sup/which-children s)))
+    (let [a2 (sup/restart-child! s :a)]
+      (is (act/alive? a2))
+      (is (thrown? Throwable (sup/delete-child! s :a)))
+      (sup/terminate-child! s :a)
+      (is (= :ok (sup/delete-child! s :a)))
+      (is (= [] (ids s))))
+    (sup/stop! s)))
+
+(deftest start-child-rejects-a-duplicate-id
+  (let [log (atom [])
+        s (sup/start {} [])]
+    (is (act/alive? (sup/start-child! s {:id :a :start (worker log :a)})))
+    (is (thrown? Throwable (sup/start-child! s {:id :a :start (worker log :a)})))
+    (is (= {:specs 1 :active 1 :supervisors 0 :workers 1} (sup/count-children s)))
+    (sup/stop! s)))
+
+(deftest a-failing-child-start-fails-the-supervisor-start
+  (let [log (atom [])]
+    (is (thrown? Throwable
+                 (sup/start {} [{:id :a :start (worker log :a true)}
+                                {:id :b :start (fn [] (throw (ex-info "no" {})))}])))
+    (is (some #{[:stop :a :shutdown]} @log))))
+
+(deftest a-child-that-ignores-shutdown-is-killed-after-its-timeout
+  (let [s (sup/start {} [{:id :stubborn :shutdown 50
+                          :start (fn [] (act/spawn-link
+                                         (fn [] (act/trap-exit!)
+                                           (loop [] (receive [_ (recur)])))))}])
+        c (sup/child s :stubborn)]
+    (sup/terminate-child! s :stubborn)
+    (is (= :killed (act/exit-reason c 1000)))
+    (sup/stop! s)))
+
+(deftest brutal-kill-kills-at-once
+  (let [log (atom [])
+        s (sup/start {} [{:id :a :shutdown :brutal-kill :start (worker log :a true)}])
+        c (sup/child s :a)]
+    (sup/terminate-child! s :a)
+    (is (= :killed (act/exit-reason c 1000)))
+    (is (not-any? #(= :stop (first %)) @log))
+    (sup/stop! s)))
 
 (defrecord Terminator [log id]
   gs/Server
   (init [_] nil)
-  (handle-call [_ _from _msg st] [:reply :ok st])
-  (handle-cast [_ _msg st] [:noreply st])
-  (handle-info [_ _msg st] [:noreply st])
+  (handle-call [_ _ _ st] [:reply :ok st])
+  (handle-cast [_ _ st] [:noreply st])
+  (handle-info [_ _ st] [:noreply st])
   (handle-timeout [_ st] [:noreply st])
-  (terminate [_ _reason _st] (swap! log conj id)))
+  (terminate [_ reason _] (swap! log conj [id reason])))
 
-(defn- terminating
-  "A child start fn: a gen-server that appends id to log when it is terminated."
-  [log id]
-  (fn [] (gs/gen-server (->Terminator log id))))
-
-(deftest shutdown-runs-child-terminates-in-stop-order
+(deftest stopping-the-tree-terminates-gen-server-children-in-reverse-order
   (let [log (atom [])
-        sup (sup/start-supervisor {:strategy :one-for-one})]
-    (sup/start-child! sup :a {:start (terminating log :a)})
-    (sup/start-child! sup :b {:start (terminating log :b)})
-    (sup/start-child! sup :c {:start (terminating log :c)})
-    (sup/stop-supervisor! sup)
-    (is (= [:c :b :a] @log))
-    (is (act/done? sup))))
+        spec (fn [id] {:id id :start #(gs/start-link (->Terminator log id) {:trap true})})
+        s (sup/start {} [(spec :a) (spec :b) (spec :c)])]
+    (sup/stop! s)
+    (is (= [[:c :shutdown] [:b :shutdown] [:a :shutdown]] @log))
+    (is (false? (act/alive? s)))))
 
-(deftest permanent-child-restarts-on-normal-exit
-  (let [a (atom 0) kill (atom nil)
-        sup (sup/start-supervisor {:strategy :one-for-one :max-restarts 5})]
-    (sup/start-child! sup :a {:start (quiet a kill) :restart :permanent})
-    (act/! @kill :bye)
-    (is (eventually (fn [] (= 2 @a))))
-    (is (= [:a] (sup/which-children! sup)))))
+(deftest supervisors-nest
+  (let [log (atom [])
+        inner {:id :inner :type :supervisor
+               :start #(sup/start-link {:intensity 0} [{:id :w :start (worker log :w)}])}
+        s (sup/start {:intensity 5} [inner])
+        inner1 (sup/child s :inner)]
+    (act/! (sup/child inner1 :w) :die)
+    (is (= :shutdown (act/exit-reason inner1 1000)))
+    (is (eventually #(let [i (sup/child s :inner)] (and i (not= i inner1)))))
+    (is (= 2 (starts log :w)))
+    (sup/stop! s)))
+
+(deftest a-supervisor-dies-with-its-parent-and-takes-the-tree
+  (let [log (atom [])
+        got (promise)
+        parent (act/spawn (fn []
+                            (deliver got (sup/start-link {} [{:id :a :start (worker log :a true)}]))
+                            (receive [:die (act/exit! :parent-gone)])))
+        s @got
+        c (sup/child s :a)]
+    (act/! parent :die)
+    (is (= :parent-gone (act/exit-reason s 1000)))
+    (is (= :shutdown (act/exit-reason c 1000)))))

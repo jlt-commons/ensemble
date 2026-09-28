@@ -1,88 +1,107 @@
 (ns ensemble.select-spec
-  "Contract for ensemble.select: selective receive over several compiled
-  patterns at once.
+  "Contract for ensemble.select: Erlang's selective receive.
 
-  The mailbox is scanned oldest message first; the first message that matches
-  any clause wins.  The reply carries the index of the clause that matched, the
-  message, and the mailbox left behind -- the matched message removed, every
-  earlier (skipped) and later message still in place."
-  (:require [writ.spec :refer [spec data ann refine graph law]]))
+  From the Erlang reference manual: the first message in the mailbox is
+  matched against the patterns in order; if one matches (and its guard
+  holds) the message is removed and that clause is chosen.  Otherwise the
+  next message is tried, and so on.  A message no clause takes stays in the
+  mailbox, in its place.  A receive that resumes after new messages arrive
+  does not re-try the messages it has already tried."
+  (:require [writ.spec :refer [spec data ann refine graph law calls]]
+            [ensemble.actor :as act]
+            [ensemble.match :as match]
+            [ensemble.select :as select]))
 
-(spec ensemble.select)
+(spec ensemble.select {:require :proved})
 
-(data Mailbox Empty (Msg Any Mailbox))
 (data Pattern Wild Nil (Lit Any) (Bind Symbol) (Cons Pattern Pattern))
-(data Scan None (Take Nat Any Mailbox))
+(data Hit (Hit Nat (Map Symbol Any)) (Miss))
+(data Scan (Take Nat Nat (Map Symbol Any)) (None Nat))
 
-(ann find-first-of [Mailbox (Vec Pattern) -> Scan])
+(ann clause-of [(Vec Pattern) (-> Nat (Map Symbol Any) Bool) Any -> Hit])
+(ann scan [(Vec Any) (Vec Pattern) (-> Nat (Map Symbol Any) Bool) Nat -> Scan])
+(ann without [(Vec Any) Nat -> (Vec Any)])
 
 ;; --- the state graph ----------------------------------------------------
 
-(refine Idle    [mb Mailbox] (= :Empty (first mb)))
-(refine Pending [mb Mailbox] (= :Msg (first mb)))
-(refine Missed  [r Scan] (= :None (first r)))
-(refine Taken   [r Scan] (= :Take (first r)))
+(refine Taken  [r Scan] (= :Take (first r)))
+(refine Missed [r Scan] (= :None (first r)))
 
-;; an empty mailbox never gives up a message; a pending one may, whichever
-;; clause it matches
+(defn yes [_ _] true)
+
 (graph receive
-  {:states {:idle Idle, :pending Pending, :missed Missed, :taken Taken}
-   :edges  {:idle    {[find-first-of (Vec Pattern)] #{:missed}}
-            :pending {[find-first-of (Vec Pattern)] #{:missed :taken}}}})
+  {:states {:mailbox (Vec Any), :taken Taken, :missed Missed}
+   :edges  {:mailbox {[scan (Vec Pattern) 'yes Nat] #{:taken :missed}}}
+   :tested {:mailbox "a mailbox of unknown length needs induction"}})
 
-(defn build [vs] (reduce (fn [mb v] [:Msg v mb]) [:Empty] (reverse vs)))
-
-(def wild [:Wild])
+;; --- the spec's vocabulary ----------------------------------------------
 
 (def p-a [:Cons [:Lit :a] [:Cons [:Bind 'x] [:Nil]]])
 (def p-b [:Cons [:Lit :b] [:Cons [:Bind 'y] [:Nil]]])
 
-;; --- no match ------------------------------------------------------------
+(defn big-x
+  "A guard: clause 0 takes only an x above 10."
+  [k env] (or (not= 0 k) (and (integer? (get env 'x)) (> (get env 'x) 10))))
 
-(law none-when-empty
-  (forall [ps (Vec Pattern)] (= (find-first-of [:Empty] ps) [:None])))
+(defn model-scan
+  "The manual's receive, message by message and clause by clause."
+  [msgs pats ok? start]
+  (or (first (for [i (range start (count msgs))
+                   k (range (count pats))
+                   :let [env (match/capture (nth pats k) (nth msgs i))]
+                   :when (and (some? env) (ok? k env))]
+               [:Take i k env]))
+      [:None (max start (count msgs))]))
 
-(law none-when-nothing-matches
-  (= (find-first-of (build [[:z 1]]) [p-a]) [:None]))
+(defn remove-at [v i] (vec (concat (take i v) (drop (inc i) v))))
 
-;; --- the oldest match wins ----------------------------------------------
+;; --- which message, which clause ----------------------------------------
 
-(law takes-oldest-wildcard
-  (forall [v Any, xs (Vec Any)]
-    (= (find-first-of (build (into [v] xs)) [wild])
-       [:Take 0 v (build xs)])))
+(law scan-is-the-manual
+  {:require :tested :because "a mailbox of unknown length needs induction, which the prover does not do over scan's keep and range"}
+  (forall [msgs (Vec Any), start Nat]
+    (and (= (scan msgs [p-a p-b] yes start) (model-scan msgs [p-a p-b] yes start))
+         (= (scan msgs [p-a [:Wild]] big-x start) (model-scan msgs [p-a [:Wild]] big-x start)))))
 
-(law skips-non-matching-and-keeps-it
-  (forall [a Any, b Any, c Any]
-    (= (find-first-of (build [a b c]) [wild]) [:Take 0 a (build [b c])])))
+(law the-oldest-message-wins-over-clause-order
+  (= (scan [[:b 2] [:a 1]] [p-a p-b] yes 0) [:Take 0 1 {'y 2}]))
 
-(law picks-oldest-tagged
-  (= (find-first-of (build [[:a 1] [:b 2]]) [p-a])
-     [:Take 0 [:a 1] (build [[:b 2]])]))
+(law clause-order-decides-for-one-message
+  (= (scan [[:a 1]] [[:Wild] p-a] yes 0) [:Take 0 0 {}]))
 
-(law removes-only-the-first-occurrence
-  (= (find-first-of (build [[:a 1] [:a 2] [:a 3]]) [p-a])
-     [:Take 0 [:a 1] (build [[:a 2] [:a 3]])]))
+(law a-failed-guard-lets-a-later-clause-take-it
+  (= (scan [[:a 1]] [p-a [:Bind 'm]] big-x 0) [:Take 0 1 {'m [:a 1]}]))
 
-;; --- clause order and message order interact ----------------------------
+(law a-failed-guard-skips-the-message
+  (= (scan [[:a 1] [:a 20]] [p-a] big-x 0) [:Take 1 0 {'x 20}]))
 
-(law clause-order-decides-index
-  (= (find-first-of (build [[:b 2]]) [p-a p-b]) [:Take 1 [:b 2] [:Empty]]))
+(law nothing-matches
+  {:require :tested :because "a mailbox of unknown length needs induction, which the prover does not do over scan's keep and range"}
+  (forall [msgs (Vec Any)]
+    (= (scan msgs [[:Lit ::never-sent]] yes 0) [:None (count msgs)])))
 
-(law oldest-message-wins-over-clause-order
-  (= (find-first-of (build [[:b 2] [:a 1]]) [p-a p-b])
-     [:Take 1 [:b 2] (build [[:a 1]])]))
+(law a-resumed-scan-skips-what-it-tried
+  (= (scan [[:a 1] [:a 2]] [p-a] yes 1) [:Take 1 0 {'x 2}]))
 
-(law keeps-ahead-and-behind
-  (= (find-first-of (build [[:z 9] [:a 1] [:z 8]]) [p-a])
-     [:Take 0 [:a 1] (build [[:z 9] [:z 8]])]))
+(law an-empty-mailbox-yields-nothing
+  (forall [start Nat] (= (scan [] [[:Wild]] yes start) [:None start])))
 
-;; --- a skipped message is never discarded, whatever its value -----------
+;; --- the rest of the mailbox stays in place ------------------------------
 
-(law keeps-skipped-nil
-  (= (find-first-of (build [nil [:a 1]]) [p-a])
-     [:Take 0 [:a 1] (build [nil])]))
+(law without-removes-exactly-one
+  {:require :tested :because "a vector of unknown length needs induction over subvec and into"}
+  (forall [msgs (Vec Any), i Nat]
+    (=> (< i (count msgs))
+        (= (without msgs i) (remove-at msgs i)))))
 
-(law keeps-nil-between-matches
-  (= (find-first-of (build [nil [:a 1] :tail]) [p-a])
-     [:Take 0 [:a 1] (build [nil :tail])]))
+(law clause-of-names-the-first-accepting-clause
+  (forall [m Any]
+    (= (clause-of [p-a [:Wild]] yes m)
+       (if (some? (match/capture p-a m)) [:Hit 0 (match/capture p-a m)] [:Hit 1 {}]))))
+
+(law clause-of-misses
+  (= (clause-of [p-a p-b] yes [:c 1]) [:Miss]))
+
+;; --- the runtime's receive goes through the scan -------------------------
+
+(calls act/receive-match {:through [select/scan select/without]})

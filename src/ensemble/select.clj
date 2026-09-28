@@ -1,36 +1,52 @@
 (ns ensemble.select
-  "Selective receive over several patterns at once.
+  "Selective receive over a mailbox, as pure data.
 
-  An actor's receive has one clause per pattern and the mailbox is scanned
-  oldest first; the first message that matches any clause wins, with the index
-  of the clause that matched.  This is ensemble.mailbox/find-first lifted from
-  one pattern to a vector of them, and it keeps the same guarantee: every
-  message ahead of the match, and every message behind it, stays in the
-  mailbox."
-  (:require [ensemble.match :as match]
-            [ensemble.mailbox :as mb]))
+  A mailbox is a vector of messages, oldest first.  A receive has one clause
+  per compiled pattern, each with an optional guard.  The scan walks the
+  mailbox oldest first; for each message it tries the clauses in order, and
+  the first clause whose pattern matches and whose guard accepts the bindings
+  wins.  The matched message is removed and every other message, ahead of it or
+  behind it, stays where it was.  That is Erlang's receive: a message no clause
+  wants is stepped over, never discarded.
 
-(defn- idx-match
-  "Index in pats of the first pattern msg matches, or nil."
-  [pats msg]
-  (first (keep-indexed
-          (fn [i p]
-            (let [b (match/capture p msg)]
-              (if (nil? b) nil i)))
-          pats)))
+  A guard is the fn ok?, called as (ok? clause-index bindings); a clause with
+  no guard is one whose ok? answers true.
 
-(defn find-first-of
-  "[:None], or [:Take pat-idx msg rest] with rest the mailbox minus msg."
-  [mbx pats]
-  (let [xs  (vec (mb/msgs mbx))
-        hit (first (keep-indexed
-                    (fn [i m]
-                      (let [k (idx-match pats m)]
-                        (if (nil? k) nil [k i])))
-                    xs))]
-    (if hit
-      (let [[k i] hit]
-        [:Take k (nth xs i)
-         (reduce mb/enqueue [:Empty]
-                 (concat (subvec xs 0 i) (subvec xs (inc i))))])
-      [:None])))
+  The scan can resume: [:None n] says the first n messages were tried and none
+  matched, so after new messages arrive a waiting receive scans from n rather
+  than from the start (Erlang's receive does the same)."
+  (:require [ensemble.match :as match]))
+
+(defn clause-of
+  "The first clause msg satisfies: [:Hit k env] with k the clause index and env
+  its bindings, or [:Miss]."
+  [pats ok? msg]
+  (loop [ps (seq pats), k 0]
+    (if ps
+      (let [env (match/capture (first ps) msg)]
+        (if (and (some? env) (ok? k env))
+          [:Hit k env]
+          (recur (next ps) (inc k))))
+      [:Miss])))
+
+(defn scan
+  "Scan msgs from index start.  [:Take i k env]: message i is the first at or
+  after start that a clause takes, clause k, binding env.  [:None n]: none
+  does, n being the count of messages scanned up to."
+  [msgs pats ok? start]
+  (let [n (count msgs)]
+    (loop [i start]
+      (if (< i n)
+        (let [r (clause-of pats ok? (nth msgs i))]
+          (case (first r)
+            :Hit (let [[_ k env] r] [:Take i k env])
+            :Miss (recur (inc i))))
+        [:None (max start n)]))))
+
+(defn without
+  "msgs with the message at index i removed, the rest in order.  Taking the
+  oldest, the usual case, costs nothing: it is a subvec."
+  [msgs i]
+  (if (zero? i)
+    (subvec msgs 1)
+    (into (subvec msgs 0 i) (subvec msgs (inc i)))))

@@ -12,32 +12,56 @@
 
   Vectors nest, so [x [:tag y]] is a tuple whose second element is itself a
   tuple.  Any other value, a map or a list among them, is a literal as
-  written.")
+  written.
+
+  As in Erlang, a name already bound where the receive is written is not a
+  binder: it matches the value it is bound to.  compile-form takes the set of
+  such names and compiles each to [:Pin sym], which the receive macro turns
+  into a literal of the local's value.  So
+
+      (let [ref (make-ref)] (receive [[ref reply] reply]))
+
+  takes only the message whose first element is that ref.")
 
 (defn- compile-atom
   "A pattern form that is not a tuple."
-  [p]
+  [p pinned]
   (cond
     (= p '_) [:Wild]
+    (and (symbol? p) (contains? pinned p)) [:Pin p]
     (symbol? p) [:Bind p]
     :else [:Lit p]))
 
 (defn- compile-tuple
   "The elements of a tuple pattern, compiled and right-nested."
-  [ps]
+  [ps pinned]
   (if (empty? ps)
     [:Nil]
     (let [p (first ps)]
-      [:Cons (if (vector? p) (compile-tuple p) (compile-atom p))
-             (compile-tuple (rest ps))])))
+      [:Cons (if (vector? p) (compile-tuple p pinned) (compile-atom p pinned))
+             (compile-tuple (rest ps) pinned)])))
 
 (defn compile-form
-  "Compile a pattern form into the tagged-data form capture matches."
-  [pat]
-  (if (vector? pat) (compile-tuple pat) (compile-atom pat)))
+  "Compile a pattern form into the tagged-data form capture matches, with the
+  names in pinned matched by value rather than bound."
+  [pat pinned]
+  (if (vector? pat) (compile-tuple pat pinned) (compile-atom pat pinned)))
+
+(defn- atom-binder
+  "The binder a pattern form that is not a tuple introduces, if any."
+  [p pinned]
+  (if (and (symbol? p) (not= p '_) (not (contains? pinned p))) [p] []))
+
+(defn- tuple-binders
+  "The binders of a tuple pattern's elements, in order, repeats included."
+  [ps pinned]
+  (if (empty? ps)
+    []
+    (let [p (first ps)]
+      (concat (if (vector? p) (tuple-binders p pinned) (atom-binder p pinned))
+              (tuple-binders (rest ps) pinned)))))
 
 (defn bound-syms
-  "The symbols a pattern binds, in order."
-  [pat]
-  (filter (fn [x] (and (symbol? x) (not= x '_)))
-          (tree-seq vector? seq pat)))
+  "The symbols a pattern binds, in order, leaving out the pinned ones."
+  [pat pinned]
+  (distinct (if (vector? pat) (tuple-binders pat pinned) (atom-binder pat pinned))))

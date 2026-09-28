@@ -1,179 +1,254 @@
 (ns ensemble.supervisor
-  "An OTP supervisor.
+  "The OTP supervisor behaviour.
 
-  A supervisor starts children from specs and watches them; when a child exits
-  it restarts children according to its strategy, unless too many restarts
-  happen too fast, in which case the whole tree shuts down.
+  A supervisor is a gen-server that traps exits, starts its children in
+  order, links to each, and restarts them when they exit.  What to restart is
+  decided by ensemble.order: whether the exit earns a restart (the child's
+  restart type), which siblings the strategy stops and starts, and whether
+  the restart intensity has been exceeded.
 
   A child spec is a map:
 
-      {:id      any     identity, unique within the supervisor
-       :start   (fn [] actor)   returns a started child actor
-       :restart :permanent | :transient | :temporary   (default :permanent)}
+      {:id       any, unique within the supervisor
+       :start    (fn [] actor)  run in the supervisor; returns the child,
+                                normally started with start-link, or nil to
+                                ignore (the spec is kept, with no child)
+       :restart  :permanent | :transient | :temporary      (:permanent)
+       :shutdown ms | :brutal-kill | :infinity    (5000, :infinity for a
+                                                   supervisor)
+       :type     :worker | :supervisor                      (:worker)}
 
-  Strategies: :one-for-one restarts only the failed child, :one-for-all
-  restarts every child, and :rest-for-one restarts the failed child and every
-  child started after it.
+  Flags: :strategy (:one-for-one, :one-for-all, :rest-for-one), :intensity and
+  :period -- more than intensity restarts within period seconds and the
+  supervisor gives up: it stops its children and exits with :shutdown, which
+  its own supervisor then sees.  OTP's defaults: one-for-one, 1 in 5.
 
-  A child's restart type decides whether its exit warrants a restart:
-  :permanent always, :transient only on an abnormal exit, :temporary never.
+  A child is stopped as OTP's supervisor does: unlinked, sent an exit signal
+  :shutdown, and given :shutdown ms to exit before it is killed.  A child that
+  traps exits (a gen-server started with {:trap true}) runs its terminate
+  first; one that does not simply dies.  Children stop in reverse start
+  order."
+  (:require [ensemble.actor :as act :refer [receive]]
+            [ensemble.gen-server :as gs]
+            [ensemble.order :as ord]))
 
-  Jolt fibers cannot be cancelled, so terminating a child only stops the
-  supervisor tracking it; the child's own body keeps running until it returns.
-  Each start carries a generation, so a superseded child's later exit is
-  ignored instead of triggering a spurious restart."
-  (:require [jolt.fibers :as fib]
-            [ensemble.actor :as act]
-            [ensemble.order :as ord]
-            [ensemble.gen-server :as gs]))
+(defn- child-of [spec]
+  {:id (:id spec)
+   :spec spec
+   :restart (:restart spec :permanent)
+   :type (:type spec :worker)
+   :shutdown (:shutdown spec (if (= :supervisor (:type spec)) :infinity 5000))
+   :actor nil})
 
-(defn- start-child-actor [spec] ((:start spec)))
+(defn- by-id [children id]
+  (first (filter (fn [c] (= id (:id c))) children)))
 
-(defn- watch!
-  "Spawn a fiber that blocks until the child exits, then tells the supervisor.
-  The generation tags which incarnation of the child this watcher guards."
-  [sup id gen actor]
-  (fib/spawn
-   (fn []
-     (let [reason (try (act/join actor) :normal
-                       (catch Throwable e e))]
-       (act/! sup [:info [:child-exit id gen reason]])))))
+(defn- by-actor [children a]
+  (first (filter (fn [c] (= a (:actor c))) children)))
 
-(defn- start-and-register [sup child]
-  (let [gen (inc (:gen child 0))
-        a (start-child-actor (:spec child))]
-    (watch! sup (:id child) gen a)
-    (assoc child :actor a :gen gen)))
+(defn- put-child [children child]
+  (mapv (fn [c] (if (= (:id c) (:id child)) child c)) children))
 
-(defn- restart?
-  [restart reason]
-  (case restart
-    :temporary false
-    :transient (not (or (= :normal reason) (= :shutdown reason)))
-    true))
+(defn- drop-child [children id]
+  (filterv (fn [c] (not= id (:id c))) children))
 
-(defn- prune-window [times max-ms now]
-  (filterv (fn [t] (<= (- now t) max-ms)) times))
+(defn- start-child
+  "Start child and link it.  [:ok child] or [:error reason]."
+  [child]
+  (try
+    (let [a ((:start (:spec child)))]
+      (when a (act/link! a))
+      [:ok (assoc child :actor a)])
+    (catch Throwable e [:error (act/reason-of e)])))
 
-(defn- child-by-id [children id]
-  (first (filter (fn [c] (= (:id c) id)) children)))
+(defn- shutdown-child
+  "Stop a running child as OTP does, and return the child with no actor."
+  [child]
+  (when-let [a (:actor child)]
+    (let [ref (act/monitor! a)
+          how (:shutdown child)]
+      (act/unlink! a)
+      (receive [[:EXIT a _] nil] [:after 0 nil])
+      (act/exit! a (if (= :brutal-kill how) :kill :shutdown))
+      (receive
+       [[:DOWN ref :process _ _] nil]
+       [:after (when (int? how) how)
+        (act/exit! a :kill)
+        (receive [[:DOWN ref :process _ _] nil])])))
+  (assoc child :actor nil))
 
-(defn- restart-ids
-  "The set of child ids to restart when id fails under strategy.  The plan is
-  in start order, but membership is what the restart loop needs."
+(defn- stop-all [children]
+  (reduce (fn [cs id] (put-child cs (shutdown-child (by-id cs id))))
+          children
+          (ord/stop-order (mapv :id children))))
+
+(defn- restart
+  "Restart after child id exited: stop and start what the strategy's plan says.
+  A child that fails to start is retried through the same path, so the retry
+  counts against the intensity."
   [strategy children id]
-  (let [ids (mapv :id children)]
-    (set (ord/plan-ids (ord/restart-order strategy ids id) ids))))
+  (let [[_ stop start] (ord/restart-plan strategy (mapv (juxt :id :restart) children) id)
+        stopped (reduce (fn [cs sid] (put-child cs (shutdown-child (by-id cs sid))))
+                        children stop)
+        kept (reduce (fn [cs sid]
+                       (if (some #{sid} start) cs (drop-child cs sid)))
+                     stopped stop)]
+    (reduce (fn [cs sid]
+              (let [r (start-child (by-id cs sid))]
+                (if (= :ok (first r))
+                  (put-child cs (second r))
+                  (do (act/! (act/self) [::retry sid]) cs))))
+            kept start)))
 
-(defn- drop-child [st id]
-  (update st :children (fn [cs] (filterv (fn [c] (not= (:id c) id)) cs))))
+(defn- child-exited
+  "Handle the exit of child with reason: restart, give up, or forget it."
+  [{:keys [strategy intensity period]} st child reason]
+  (let [cs (:children st)]
+    (if (ord/restart? (:restart child) reason)
+      (let [[verdict times] (ord/intensity (:restarts st) (System/currentTimeMillis)
+                                           (* 1000 period) intensity)
+            st (assoc st :restarts times)]
+        (if (= :Exceed verdict)
+          [:stop :shutdown (assoc st :children (put-child cs (assoc child :actor nil)))]
+          [:noreply (assoc st :children
+                           (restart strategy (put-child cs (assoc child :actor nil)) (:id child)))]))
+      [:noreply (assoc st :children
+                       (if (= :temporary (:restart child))
+                         (drop-child cs (:id child))
+                         (put-child cs (assoc child :actor nil))))])))
 
-(defrecord Supervisor [strategy max-restarts max-seconds initial]
+(defn- info [c] (select-keys c [:id :actor :type :restart]))
+
+(defrecord Supervisor [flags specs]
   gs/Server
   (init [_]
-    {:restarts []
-     :children (mapv (fn [spec]
-                       (start-and-register (act/self)
-                                           {:id (:id spec)
-                                            :spec spec
-                                            :restart (:restart spec :permanent)}))
-                     initial)})
-  (handle-call [_ _from msg st]
-    (case (first msg)
-      :start-child
-      (let [child (start-and-register (act/self)
-                                      {:id (nth msg 1)
-                                       :spec (nth msg 2)
-                                       :restart (nth msg 3 :permanent)})]
-        [:reply (:id child) (update st :children conj child)])
-      :terminate-child
-      [:reply :ok (drop-child st (nth msg 1))]
-      :remove-child
-      [:reply :ok (drop-child st (nth msg 1))]
-      :remove-and-terminate-child
-      (let [id (nth msg 1)
-            c (child-by-id (:children st) id)]
-        (when-let [a (:actor c)] (act/! a [:ensemble/shutdown :shutdown]))
-        [:reply :ok (drop-child st id)])
-      :get-child
-      (let [c (child-by-id (:children st) (nth msg 1))]
-        [:reply (:actor c) st])
-      :which-children
-      [:reply (mapv :id (:children st)) st]))
-  (handle-cast [_ _msg st] [:noreply st])
+    (let [cs (reduce (fn [cs spec]
+                       (let [r (start-child (child-of spec))]
+                         (if (= :ok (first r))
+                           (conj cs (second r))
+                           (do (stop-all cs)
+                               (throw (ex-info "supervisor failed to start a child"
+                                               {:reason [:shutdown [:failed-to-start-child (:id spec) (second r)]]}))))))
+                     [] specs)]
+      {:children cs :restarts []}))
+  (handle-call [_ req _ st]
+    (let [cs (:children st)
+          id (second req)
+          c (by-id cs id)]
+      (case (first req)
+        :start-child
+        (let [spec (second req)]
+          (if (by-id cs (:id spec))
+            [:reply [:error (if (:actor (by-id cs (:id spec))) :already-started :already-present)] st]
+            (let [r (start-child (child-of spec))]
+              (if (= :ok (first r))
+                [:reply [:ok (:actor (second r))] (update st :children conj (second r))]
+                [:reply r st]))))
+        :terminate-child
+        (cond
+          (nil? c) [:reply [:error :not-found] st]
+          (= :temporary (:restart c)) (do (shutdown-child c) [:reply [:ok nil] (assoc st :children (drop-child cs id))])
+          :else [:reply [:ok nil] (assoc st :children (put-child cs (shutdown-child c)))])
+        :restart-child
+        (cond
+          (nil? c) [:reply [:error :not-found] st]
+          (:actor c) [:reply [:error :running] st]
+          :else (let [r (start-child c)]
+                  (if (= :ok (first r))
+                    [:reply [:ok (:actor (second r))] (assoc st :children (put-child cs (second r)))]
+                    [:reply r st])))
+        :delete-child
+        (cond
+          (nil? c) [:reply [:error :not-found] st]
+          (:actor c) [:reply [:error :running] st]
+          :else [:reply [:ok nil] (assoc st :children (drop-child cs id))])
+        :which-children [:reply [:ok (mapv info cs)] st]
+        :count-children [:reply [:ok {:specs (count cs)
+                                      :active (count (filter :actor cs))
+                                      :supervisors (count (filter #(= :supervisor (:type %)) cs))
+                                      :workers (count (filter #(= :worker (:type %)) cs))}]
+                         st])))
+  (handle-cast [_ _ st] [:noreply st])
   (handle-info [_ msg st]
-    (let [[_ id gen reason] msg
-          child (first (filter (fn [c] (and (= (:id c) id) (= (:gen c) gen)))
-                               (:children st)))
-          now (System/currentTimeMillis)
-          window (prune-window (:restarts st) (* 1000 max-seconds) now)]
-      (cond
-        (nil? child) [:noreply st]
-        (not (restart? (:restart child) reason)) [:noreply (drop-child st id)]
-        (> (inc (count window)) max-restarts) [:stop :shutdown (assoc st :restarts window)]
-        :else
-        (let [ids (restart-ids strategy (:children st) id)
-              children (mapv (fn [c]
-                               (if (contains? ids (:id c))
-                                 (start-and-register (act/self) c)
-                                 c))
-                             (:children st))]
-          [:noreply {:children children :restarts (conj window now)}]))))
+    (cond
+      (and (vector? msg) (= :EXIT (first msg)))
+      (if-let [c (by-actor (:children st) (second msg))]
+        (child-exited flags st c (nth msg 2))
+        [:noreply st])
+
+      (and (vector? msg) (= ::retry (first msg)))
+      (if-let [c (by-id (:children st) (second msg))]
+        (if (:actor c) [:noreply st] (child-exited flags st c :start-failed))
+        [:noreply st])
+
+      :else [:noreply st]))
   (handle-timeout [_ st] [:noreply st])
-  (terminate [_ _reason st]
-    (let [ids (mapv :id (:children st))]
-      (doseq [id (ord/plan-ids (ord/stop-order ids) ids)]
-        (when-let [a (:actor (child-by-id (:children st) id))]
-          (act/! a [:ensemble/shutdown :shutdown])
-          (try (act/join a 1000) (catch Throwable _ nil)))))))
+  (terminate [_ _ st] (stop-all (:children st))))
 
-(defn start-supervisor
-  "Start a supervisor.  Options:
+(defn- start* [start-fn flags specs opts]
+  (let [flags (merge {:strategy :one-for-one :intensity 1 :period 5} flags)]
+    (start-fn (->Supervisor flags (vec specs)) (assoc opts :trap true))))
 
-      :strategy      :one-for-one | :one-for-all | :rest-for-one
-      :max-restarts  restarts allowed within :max-seconds before shutdown
-      :max-seconds   the window :max-restarts is counted over
-      :children      a seq of child specs to start before the supervisor runs"
-  ([] (start-supervisor {}))
-  ([{:keys [strategy max-restarts max-seconds children]
-     :or   {strategy :one-for-one max-restarts 3 max-seconds 5}}]
-   (gs/gen-server (->Supervisor strategy max-restarts max-seconds children))))
+(defn start
+  "Start a supervisor with flags {:strategy :intensity :period} and child
+  specs, started in order before this returns.  Options as gen-server start
+  (:name).  Throws if a child fails to start."
+  ([flags specs] (start flags specs {}))
+  ([flags specs opts] (start* gs/start flags specs opts)))
+
+(defn start-link
+  "start, linked to the calling actor -- how a supervisor is started as the
+  child of another."
+  ([flags specs] (start-link flags specs {}))
+  ([flags specs opts] (start* gs/start-link flags specs opts)))
+
+(defn- result [r]
+  (if (= :ok (first r))
+    (second r)
+    (throw (ex-info (str "supervisor: " (pr-str (second r))) {:reason (second r)}))))
 
 (defn start-child!
-  "Start a child from spec under sup.  Returns the child id."
-  [sup id spec]
-  (gs/call! sup [:start-child id spec (:restart spec :permanent)]))
+  "Start a child from spec and add it.  Returns the child actor (nil if its
+  start ignored).  Throws if the id is taken or the start fails."
+  [sup spec]
+  (result (gs/call! sup [:start-child spec] nil)))
 
-(defn terminate-child! [sup id]
-  (gs/call! sup [:terminate-child id]))
-
-(defn get-child
-  "The live child actor registered under id, or nil."
+(defn terminate-child!
+  "Stop the child id.  Its spec stays, so restart-child! can start it again
+  (a :temporary child's spec is dropped).  Throws if there is no such child."
   [sup id]
-  (gs/call! sup [:get-child id]))
+  (result (gs/call! sup [:terminate-child id] nil))
+  :ok)
 
-(defn remove-child!
-  "Stop tracking the child under id, leaving its actor running."
+(defn restart-child!
+  "Start again the stopped child id.  Returns the child actor."
   [sup id]
-  (gs/call! sup [:remove-child id]))
+  (result (gs/call! sup [:restart-child id] nil)))
 
-(defn remove-and-terminate-child!
-  "Stop tracking the child under id and best-effort stop it.  Jolt fibers cannot
-  be cancelled, so the supervisor sends the child a shutdown message (which a
-  gen-server child honours) and otherwise just untracks it."
+(defn delete-child!
+  "Remove the stopped child id's spec."
   [sup id]
-  (gs/call! sup [:remove-and-terminate-child id]))
+  (result (gs/call! sup [:delete-child id] nil))
+  :ok)
 
-(defn which-children!
-  "The ids of the supervisor's live children, in start order."
+(defn which-children
+  "The children, in start order: [{:id :actor :type :restart}], :actor nil
+  for a child that is not running."
   [sup]
-  (gs/call! sup [:which-children]))
+  (result (gs/call! sup [:which-children])))
 
-(defn stop-supervisor!
-  "Stop the supervisor and its tree.  Children are terminated in stop order
-  (start order reversed), each running its terminate, then the supervisor
-  stops.  Blocks until the whole tree has settled.  Returns sup."
+(defn count-children
+  "{:specs :active :supervisors :workers}."
   [sup]
-  (gs/shutdown! sup :shutdown)
-  (try (act/join sup) (catch Throwable _ nil))
-  sup)
+  (result (gs/call! sup [:count-children])))
+
+(defn child
+  "The running actor of child id, or nil."
+  [sup id]
+  (:actor (first (filter #(= id (:id %)) (which-children sup)))))
+
+(defn stop!
+  "Stop the supervisor: its children stop in reverse start order, then it
+  exits with reason (default :normal).  Waits until it has."
+  ([sup] (gs/stop! sup :normal))
+  ([sup reason] (gs/stop! sup reason)))
