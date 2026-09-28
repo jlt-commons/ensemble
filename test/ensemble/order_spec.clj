@@ -24,6 +24,7 @@
 (data Verdict (Allow (Vec Int)) (Exceed (Vec Int)))
 
 (ann restart? [Keyword Any -> Bool])
+(ann index-of [(List Nat) Nat -> Any])
 (ann restart-plan [Strategy (Vec (Tuple Nat Restart)) Nat -> Plan])
 (ann stop-order [(Vec Nat) -> (Vec Nat)])
 (ann intensity [(Vec Int) Int Nat Nat -> Verdict])
@@ -50,10 +51,10 @@
 (defn distinct-ids? [cs] (= (count cs) (count (distinct (map first cs)))))
 
 (defn model-plan
-  "The plan, straight from the docs' wording."
+  "The plan, straight from the docs' wording.  Where id stands among the
+  children is index-of's, whose own laws say what it is."
   [strategy cs id]
-  (let [ids (mapv first cs)
-        i (first (keep-indexed (fn [i x] (when (= x id) i)) ids))]
+  (let [i (ord/index-of (mapv first cs) id)]
     (if (nil? i)
       [:Plan [] []]
       (let [hit (case strategy
@@ -107,25 +108,60 @@
 (law a-temporary-child-that-failed-is-its-own-start
   (= (restart-plan :one-for-all abc 3) [:Plan [2 1] [1 2 3]]))
 
+(law an-absent-id-has-no-index
+  (forall [cs (Vec (Tuple Nat Restart)), id Nat]
+    (=> (not-any? #(= id (first %)) cs)
+        (nil? (index-of (mapv first cs) id)))))
+
+(law a-found-index-is-a-position
+  (forall [ids (List Nat), id Nat]
+    (=> (some? (index-of ids id))
+        (and (integer? (index-of ids id)) (<= 0 (index-of ids id))))))
+
+(law a-child-index-is-a-position
+  (forall [cs (Vec (Tuple Nat Restart)), id Nat]
+    (=> (some? (index-of (mapv first cs) id))
+        (and (integer? (index-of (mapv first cs) id)) (<= 0 (index-of (mapv first cs) id))))))
+
+(law the-restarted-from-a-child-include-it
+  (forall [xs (Vec (Tuple Nat Restart)), id Nat]
+    (=> (some? (index-of (mapv first xs) id))
+        (some #{id}
+              (for [c (drop (index-of (mapv first xs) id) xs)
+                    :when (or (= id (first c)) (not= :temporary (second c)))]
+                (first c))))))
+
+(law an-index-names-a-child-with-the-id
+  (forall [cs (Vec (Tuple Nat Restart)), id Nat]
+    (=> (some? (index-of (mapv first cs) id))
+        (and (< (index-of (mapv first cs) id) (count cs))
+             (= id (first (nth cs (index-of (mapv first cs) id))))))))
+
+(law a-child-present-has-an-index
+  (forall [cs (Vec (Tuple Nat Restart)), i Nat]
+    (=> (< i (count cs))
+        (integer? (index-of (mapv first cs) (first (nth cs i)))))))
+
+(law index-of-example (= (index-of [4 7 9] 7) 1))
+
 (law an-unknown-child-plans-nothing
-  {:require :tested :because "children of unknown length are outside the prover"}
   (forall [s Strategy, cs (Vec (Tuple Nat Restart))]
     (=> (not-any? #(= 99 (first %)) cs)
         (= (restart-plan s cs 99) [:Plan [] []]))))
 
 (law restart-plan-is-the-docs
-  {:require :tested :because "children of unknown length are outside the prover"}
   (forall [s Strategy, cs (Vec (Tuple Nat Restart)), id Nat]
     (=> (distinct-ids? cs)
         (= (restart-plan s cs id) (model-plan s cs id)))))
 
-(law the-failed-child-is-never-stopped-and-always-started
-  {:require :tested :because "children of unknown length are outside the prover"}
+(law the-failed-child-is-never-stopped
+  (forall [s Strategy, cs (Vec (Tuple Nat Restart)), id Nat]
+    (not (some #{id} (second (restart-plan s cs id))))))
+
+(law the-failed-child-is-always-started
   (forall [s Strategy, cs (Vec (Tuple Nat Restart)), i Nat]
-    (=> (and (distinct-ids? cs) (< i (count cs)))
-        (let [id (first (nth cs i))
-              [_ stop start] (restart-plan s cs id)]
-          (and (not (some #{id} stop)) (some #{id} start))))))
+    (=> (< i (count cs))
+        (some #{(first (nth cs i))} (nth (restart-plan s cs (first (nth cs i))) 2)))))
 
 (law stop-order-reverses-start-order
   (forall [ids (Vec Nat)] (= (stop-order ids) (vec (reverse ids)))))
@@ -135,7 +171,6 @@
 ;; --- restart intensity --------------------------------------------------
 
 (law intensity-is-the-docs
-  {:require :tested :because "a vector of unknown length is outside the prover"}
   (forall [times (Vec Int), now Int, period Nat, max-r Nat]
     (= (intensity times now period max-r) (model-intensity times now period max-r))))
 

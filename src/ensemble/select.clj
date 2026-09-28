@@ -41,7 +41,8 @@
           (case (first r)
             :Hit (let [[_ k env] r] [:Take i k env])
             :Miss (recur (inc i))))
-        [:None (max start n)]))))
+        ;; i is start past the end, or else the end
+        [:None i]))))
 
 (defn without
   "msgs with the message at index i removed, the rest in order.  Taking the

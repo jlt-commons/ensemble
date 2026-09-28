@@ -25,9 +25,13 @@
     (= :transient restart) (not (sig/shutdown? reason))
     :else true))
 
-(defn- index-of
+(defn index-of
+  "The position of the first of ids equal to id, or nil when none is."
   [ids id]
-  (first (keep-indexed (fn [i x] (when (= x id) i)) ids)))
+  (when (seq ids)
+    (if (= id (first ids))
+      0
+      (when-let [i (index-of (rest ids) id)] (inc i)))))
 
 (defn- affected
   "The children the strategy touches when id fails, in start order."
@@ -36,7 +40,7 @@
     (cond
       (nil? i) []
       (= :one-for-all strategy) (vec children)
-      (= :rest-for-one strategy) (vec (subvec (vec children) i))
+      (= :rest-for-one strategy) (vec (drop i children))
       :else [(nth children i)])))
 
 (defn restart-plan

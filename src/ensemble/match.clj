@@ -21,13 +21,27 @@
   As in Erlang, a name bound twice in one pattern must match equal values:
   [x x] matches [1 1] but not [1 2].
 
+  Values are compared as = does, except that a NaN matches a NaN: a
+  literal NaN pattern takes a NaN message, and [x x] matches [NaN NaN].
+  Erlang has no NaN; Clojure's = says NaN is not NaN, which would make a
+  pattern that names one match nothing.
+
   capture returns the bindings it captured as a map, or nil when the pattern
   does not match.")
+
+(defn- same?
+  "= with a NaN the same as a NaN.  Only a NaN is a number not = to itself.
+  A NaN inside a collection compares as = does: a tuple pattern takes a
+  message apart element by element, so each NaN it names meets one here."
+  [a b]
+  (or (= a b)
+      ;; the NaN test first: on any other value it settles this at once
+      (and (not= a a) (not= b b) (number? a) (number? b))))
 
 (defn- agree
   "b and c merged, or nil when they bind a name to different values."
   [b c]
-  (when (every? (fn [k] (or (not (contains? b k)) (= (get b k) (get c k))))
+  (when (every? (fn [k] (or (not (contains? b k)) (same? (get b k) (get c k))))
                 (keys c))
     (merge b c)))
 
@@ -38,7 +52,7 @@
   (case (first p)
     :Wild {}
     :Nil  (if (and (sequential? m) (empty? m)) {} nil)
-    :Lit  (if (= (nth p 1) m) {} nil)
+    :Lit  (if (same? (nth p 1) m) {} nil)
     :Bind {(nth p 1) m}
     :Cons (let [[_ hd tl] p]
             (if (and (sequential? m) (seq m))

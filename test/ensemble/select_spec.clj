@@ -7,7 +7,7 @@
   next message is tried, and so on.  A message no clause takes stays in the
   mailbox, in its place.  A receive that resumes after new messages arrive
   does not re-try the messages it has already tried."
-  (:require [writ.spec :refer [spec data ann refine graph law calls]]
+  (:require [writ.spec :refer [spec data ann refine graph law calls same]]
             [ensemble.actor :as act]
             [ensemble.match :as match]
             [ensemble.select :as select]))
@@ -31,8 +31,7 @@
 
 (graph receive
   {:states {:mailbox (Vec Any), :taken Taken, :missed Missed}
-   :edges  {:mailbox {[scan (Vec Pattern) 'yes Nat] #{:taken :missed}}}
-   :tested {:mailbox "a mailbox of unknown length needs induction"}})
+   :edges  {:mailbox {[scan (Vec Pattern) 'yes Nat] #{:taken :missed}}}})
 
 ;; --- the spec's vocabulary ----------------------------------------------
 
@@ -58,7 +57,6 @@
 ;; --- which message, which clause ----------------------------------------
 
 (law scan-is-the-manual
-  {:require :tested :because "a mailbox of unknown length needs induction, which the prover does not do over scan's keep and range"}
   (forall [msgs (Vec Any), start Nat]
     (and (= (scan msgs [p-a p-b] yes start) (model-scan msgs [p-a p-b] yes start))
          (= (scan msgs [p-a [:Wild]] big-x start) (model-scan msgs [p-a [:Wild]] big-x start)))))
@@ -76,9 +74,8 @@
   (= (scan [[:a 1] [:a 20]] [p-a] big-x 0) [:Take 1 0 {'x 20}]))
 
 (law nothing-matches
-  {:require :tested :because "a mailbox of unknown length needs induction, which the prover does not do over scan's keep and range"}
-  (forall [msgs (Vec Any)]
-    (= (scan msgs [[:Lit ::never-sent]] yes 0) [:None (count msgs)])))
+  (forall [msgs (Vec Any), start Nat]
+    (= (scan msgs [] yes start) [:None (max start (count msgs))])))
 
 (law a-resumed-scan-skips-what-it-tried
   (= (scan [[:a 1] [:a 2]] [p-a] yes 1) [:Take 1 0 {'x 2}]))
@@ -86,10 +83,38 @@
 (law an-empty-mailbox-yields-nothing
   (forall [start Nat] (= (scan [] [[:Wild]] yes start) [:None start])))
 
+;; --- what a scan says, for any clauses -----------------------------------
+;; Together these pin the scan down: the message it takes is the first at
+;; or after start that a clause takes, and a scan that takes none stops at
+;; the end.
+
+(law a-take-is-a-clause-taking-a-message
+  (forall [msgs (Vec Any), pats (Vec Pattern), start Nat]
+    (=> (= :Take (first (scan msgs pats yes start)))
+        ;; the bindings too are the clause's, but = on them is not
+        ;; reflexive -- a message may hold ##NaN -- so scan-is-the-manual
+        ;; tests those
+        (let [i (second (scan msgs pats yes start))]
+          (and (<= start i) (< i (count msgs))
+               (= :Hit (first (clause-of pats yes (nth msgs i)))))))))
+
+(law every-message-stepped-over-misses
+  (forall [msgs (Vec Any), pats (Vec Pattern), start Nat, j Nat]
+    (=> (and (<= start j) (< j (second (scan msgs pats yes start))))
+        (= :Miss (first (clause-of pats yes (nth msgs j)))))))
+
+(law a-scan-that-takes-nothing-stops-at-the-end
+  (forall [msgs (Vec Any), pats (Vec Pattern), start Nat]
+    (=> (= :None (first (scan msgs pats yes start)))
+        (= (second (scan msgs pats yes start)) (max start (count msgs))))))
+
+;; a message of any value, NaN too, is taken by a clause that binds it
+(law a-binder-takes-any-message
+  (forall [m Any!] (same (scan [m] [[:Bind 'x]] yes 0) [:Take 0 0 {'x m}])))
+
 ;; --- the rest of the mailbox stays in place ------------------------------
 
 (law without-removes-exactly-one
-  {:require :tested :because "a vector of unknown length needs induction over subvec and into"}
   (forall [msgs (Vec Any), i Nat]
     (=> (< i (count msgs))
         (= (without msgs i) (remove-at msgs i)))))

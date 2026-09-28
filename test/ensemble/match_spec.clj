@@ -1,7 +1,7 @@
 (ns ensemble.match-spec
   "The contract for ensemble.match: a compiled receive pattern matched against
   a message either fails (nil) or yields the bindings it captured."
-  (:require [writ.spec :refer [spec data ann refine graph law]]))
+  (:require [writ.spec :refer [spec data ann refine graph law same]]))
 
 (spec ensemble.match {:require :proved})
 
@@ -32,8 +32,7 @@
             :bind  {[capture Any] #{:matched}}
             :lit   {[capture Any] #{:outcome}}
             :tuple {[capture Any] #{:outcome}}}
-   :tested {:lit "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"
-            :tuple "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"}})
+   :tested {:tuple "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"}})
 
 (def two-tuple [:Cons [:Wild] [:Nil]])
 (def bind-pair [:Cons [:Bind 'l] [:Cons [:Bind 'r] [:Nil]]])
@@ -47,7 +46,6 @@
     (=> (= p [:Wild]) (= (capture p m) {}))))
 
 (law nil-matches-only-empty
-  {:require :tested :because "a vector of unknown length needs induction"}
   (forall [xs (Vec Any)] (= (capture [:Nil] xs) (if (empty? xs) {} nil))))
 
 (law lit-matches-itself
@@ -89,3 +87,23 @@
 
 (law distinct-names-bind-independently
   (forall [a Any, b Any] (= (capture bind-pair [a b]) {'l a 'r b})))
+
+;; --- NaN ------------------------------------------------------------------
+;; Erlang has no NaN, and Clojure's = says NaN is not NaN.  capture compares
+;; as = does but with a NaN the same as a NaN, so a pattern that names a NaN
+;; matches one.
+
+(law a-binder-captures-any-value-nan-too
+  (forall [s Symbol, v Any!] (same (capture [:Bind s] v) {s v})))
+
+(law a-wildcard-matches-nan (= {} (capture [:Wild] ##NaN)))
+
+(law a-nan-literal-matches-nan (= {} (capture [:Lit ##NaN] ##NaN)))
+
+(law a-nan-literal-matches-nothing-else
+  (forall [v Any] (nil? (capture [:Lit ##NaN] v))))
+
+(law a-name-bound-twice-matches-two-nans (same {'x ##NaN} (capture twice [##NaN ##NaN])))
+
+(law a-nan-in-a-tuple-matches-a-nan-there
+  (= {} (capture [:Cons [:Lit 1] [:Cons [:Lit ##NaN] [:Nil]]] [1 ##NaN])))

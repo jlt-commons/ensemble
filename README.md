@@ -240,10 +240,21 @@ written from the Erlang/OTP documentation:
 | `ensemble.callback` | what a gen_server callback's return means | `callback_spec` |
 | `ensemble.statem` | gen_statem results, actions, postpone order, timeouts | `statem_spec` |
 
-Every spec requires proof (`{:require :proved}`): 146 of their 163 laws
-are proved, 67 of them for every input. The 17 left to testing each say
-why -- all are about collections of unknown length or patterns of unbounded
-depth, which need induction.
+Every spec requires proof (`{:require :proved}`): 176 of their 181 laws
+are proved, 92 of them for every input -- among them that a selective
+receive is the manual's, message by message and clause by clause, that a
+restart plan is the supervisor docs', and that no gen_statem event is lost
+or duplicated, over mailboxes, children and queues of any length. The 5
+left to testing each say why: they recurse over patterns of any depth, or
+over a callback's list of actions. `test/ensemble/order_proof.clj` holds
+the lemmas about clojure.core the supervisor's proofs cite.
+
+A law over `Any` covers values without NaN; one over `Any!` takes NaN in
+and compares with writ's `same`, where a NaN is the same as a NaN. Erlang
+has no NaN, and Clojure's `=` says NaN is not NaN; the matcher compares
+as `=` does but with a NaN the same as a NaN, so a literal NaN pattern
+takes a NaN message, and a name bound twice matches two NaNs. The match
+spec states both.
 
 Each spec also states, with `calls`, that the effectful runtime goes through
 these fns. For example, `ensemble.actor/handle-signal!` must reach

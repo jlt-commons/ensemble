@@ -153,17 +153,19 @@
      [:Queues [] [[:internal 1] [:internal 2] [:cast :p] [:cast :q]]]))
 
 (law next-queues-is-the-docs
-  {:require :tested :because "queues of unknown length need induction"}
   (forall [changed Bool, postpone Bool, e Any, postponed (Vec Any), inserted (Vec Any), queue (Vec Any)]
     (= (next-queues changed postpone e postponed inserted queue)
        (model-queues changed postpone e postponed inserted queue))))
 
+(defn occurrences [x xs] (count (filter #(= x %) xs)))
+
+;; the queues after hold what was there before and the postponed event,
+;; each as often: every value occurs in them as many times
 (law no-event-is-lost-or-duplicated
-  {:require :tested :because "queues of unknown length need induction, and sorting by pr-str is outside the prover"}
-  (forall [changed Bool, postpone Bool, e Any, postponed (Vec Any), inserted (Vec Any), queue (Vec Any)]
+  (forall [changed Bool, postpone Bool, e Any, postponed (Vec Any), inserted (Vec Any), queue (Vec Any), x Any]
     (let [[_ p q] (next-queues changed postpone e postponed inserted queue)]
-      (= (sort-by pr-str (concat p q))
-         (sort-by pr-str (concat postponed inserted queue (if postpone [e] [])))))))
+      (= (occurrences x (concat p q))
+         (occurrences x (concat postponed inserted queue (if postpone [e] [])))))))
 
 ;; --- timers -------------------------------------------------------------
 
