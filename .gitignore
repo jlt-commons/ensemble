@@ -10,3 +10,9 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# local agent and issue-tracker state
+.agents/
+.beads/
+.claude/
+.codex/
