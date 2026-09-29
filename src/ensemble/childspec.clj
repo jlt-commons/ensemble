@@ -78,3 +78,57 @@
                     [:Error [:duplicate-child-name (:id c)]]
                     (recur (next todo) (concat out [c]))))))
         [:Ok (vec out)]))))
+
+;; --- what a supervisor does with a child's start, and which operations a
+;; --- child allows
+
+(defn after-start
+  "What the supervisor keeps once a child's start gave outcome:
+  [:Started actor], [:Ignored] or [:Failed reason].  [:Add actor] keeps
+  the child (actor nil: kept without a process, OTP's undefined), [:Skip]
+  keeps nothing, [:Refuse reason] is a failed start.  An ignored
+  :temporary child, or one of a :simple-one-for-one supervisor, is not
+  kept."
+  [strategy restart outcome]
+  (case (first outcome)
+    :Started (let [[_ a] outcome] [:Add a])
+    :Ignored (if (or (= :temporary restart) (= :simple-one-for-one strategy))
+               [:Skip]
+               [:Add nil])
+    :Failed (let [[_ e] outcome] [:Refuse e])))
+
+(defn start-reply
+  "What start_child answers for outcome: [:ok actor], [:ok nil] for an
+  ignored start, or [:error reason]."
+  [outcome]
+  (case (first outcome)
+    :Started (let [[_ a] outcome] [:ok a])
+    :Ignored [:ok nil]
+    :Failed (let [[_ e] outcome] [:error e])))
+
+(defn may
+  "May op ([:Restart], [:Delete] or [:Terminate]) run on a child of status
+  [:Running], [:Restarting], [:Stopped] or [:Absent]?  [:Go], or [:No
+  reason].  simple? is a :simple-one-for-one supervisor, which refuses
+  restart and delete."
+  [op simple? status]
+  (let [absent? (case (first status) :Absent true false)]
+    (case (first op)
+      :Terminate (if absent? [:No :not-found] [:Go])
+      (:Restart :Delete)
+      (cond
+        simple? [:No :simple-one-for-one]
+        absent? [:No :not-found]
+        :else (case (first status)
+                :Running [:No :running]
+                :Restarting [:No :restarting]
+                [:Go])))))
+
+(defn shown
+  "What which_children shows as the child of a child of status: its actor
+  a, :restarting, or nil (OTP's undefined)."
+  [status a]
+  (case (first status)
+    :Running a
+    :Restarting :restarting
+    nil))

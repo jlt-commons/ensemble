@@ -13,8 +13,9 @@
 
       {:id          any, unique within the supervisor
        :start       (fn [& args] actor)  run in the supervisor; returns the
-                    child, normally started with start-link, or nil to
-                    ignore (the spec is kept, with no child)
+                    child, normally started with start-link ([:ok actor]
+                    too), :ignore or nil to start no process (the spec is
+                    kept with none, unless :temporary), or [:error e]
        :restart     :permanent | :transient | :temporary     (:permanent)
        :shutdown    ms | :brutal-kill | :infinity    (5000, :infinity for a
                                                       supervisor)
@@ -62,14 +63,28 @@
 (defn- drop-child [children k]
   (filterv (fn [c] (not= k (:key c))) children))
 
-(defn- start-child
-  "Start child and link it.  [:ok child] or [:error reason]."
+(defn- launch
+  "Run child's start and link what it started.  [:Started actor],
+  [:Ignored] or [:Failed reason], as OTP reads {ok, Pid}, ignore and
+  {error, E}; any other return fails with itself as the reason."
   [child]
-  (try
-    (let [a (apply (:start child) (:args child))]
-      (when a (act/link! a))
-      [:ok (assoc child :actor a)])
-    (catch Throwable e [:error (act/reason-of e)])))
+  (let [r (try (apply (:start child) (:args child))
+               (catch Throwable e [::threw (act/reason-of e)]))]
+    (cond
+      (or (nil? r) (= :ignore r)) [:Ignored]
+      (and (vector? r) (= ::threw (first r))) [:Failed (second r)]
+      (and (vector? r) (= :error (first r)) (= 2 (count r))) [:Failed (second r)]
+      (and (vector? r) (= :ok (first r)) (act/pid? (second r))) (do (act/link! (second r)) [:Started (second r)])
+      (act/pid? r) (do (act/link! r) [:Started r])
+      :else [:Failed r])))
+
+(defn- status
+  "A child as the operations on it see it."
+  [c]
+  (cond (nil? c) [:Absent]
+        (:actor c) [:Running]
+        (:restarting c) [:Restarting]
+        :else [:Stopped]))
 
 (defn- shutdown-child
   "Stop a running child as OTP does, and return the child with no actor."
@@ -106,10 +121,13 @@
                        (if (some #{sk} start) cs (drop-child cs sk)))
                      stopped stop)]
     (reduce (fn [cs sk]
-              (let [r (start-child (by-key cs sk))]
-                (if (= :ok (first r))
-                  (put-child cs (second r))
-                  (do (act/! (act/self) [::retry sk]) cs))))
+              (let [c (by-key cs sk)
+                    kept (cs/after-start strategy (:restart c) (launch c))]
+                (case (first kept)
+                  :Add (put-child cs (assoc c :actor (second kept) :restarting false))
+                  :Skip (drop-child cs sk)
+                  :Refuse (do (act/! (act/self) [::retry sk])
+                              (put-child cs (assoc c :restarting true))))))
             kept start)))
 
 (defn- significant-left
@@ -145,24 +163,23 @@
   template with extra args; otherwise a new child from spec, checked as the
   specs at start are."
   [flags st arg]
-  (let [cs (:children st)]
+  (let [cs (:children st)
+        add (fn [st c]
+              (let [outcome (launch c)
+                    kept (cs/after-start (:strategy flags) (:restart c) outcome)
+                    st (case (first kept)
+                         :Add (update st :children conj (assoc c :actor (second kept)))
+                         st)]
+                [:reply (cs/start-reply outcome) st]))]
     (if (simple? flags)
-      (let [k [::dynamic (:next st 0)]
-            r (start-child (child-of (:template st) k (vec arg)))]
-        (if (= :ok (first r))
-          [:reply [:ok (:actor (second r))]
-           (-> st (update :children conj (second r)) (update :next (fnil inc 0)))]
-          [:reply r st]))
+      (add (update st :next (fnil inc 0)) (child-of (:template st) [::dynamic (:next st 0)] (vec arg)))
       (let [checked (cs/check-child arg (:auto-shutdown flags))]
         (case (first checked)
           :Error [:reply [:error (second checked)] st]
           :Ok (let [[_ spec] checked]
                 (if-let [c (by-key cs (:id spec))]
                   [:reply [:error (if (:actor c) :already-started :already-present)] st]
-                  (let [r (start-child (child-of spec (:id spec) []))]
-                    (if (= :ok (first r))
-                      [:reply [:ok (:actor (second r))] (update st :children conj (second r))]
-                      [:reply r st])))))))))
+                  (add st (child-of spec (:id spec) [])))))))))
 
 (defn- spec-of [c] (select-keys c [:id :start :restart :shutdown :type :significant]))
 
@@ -174,58 +191,70 @@
   [flags cs x]
   (if (simple? flags) (by-actor cs x) (by-key cs x)))
 
+(defn- start-all
+  "Start the children of specs in order.  [:ok children], or, when one
+  fails, the ones started stopped and [:failed id reason]."
+  [strategy specs]
+  (reduce (fn [cs spec]
+            (let [c (child-of spec (:id spec) [])
+                  kept (cs/after-start strategy (:restart c) (launch c))]
+              (case (first kept)
+                :Add (conj cs (assoc c :actor (second kept)))
+                :Skip cs
+                :Refuse (do (stop-all cs) (reduced [:failed (:id spec) (second kept)])))))
+          [] specs))
+
+(defn- child-call
+  "The calls on one child, and the listings: what each may do is decided
+  by ensemble.childspec/may, what a listing shows by shown."
+  [flags st req]
+  (let [cs (:children st)
+        c (find-child flags cs (second req))
+        simple (simple? flags)
+        op (case (first req) :terminate-child [:Terminate] :restart-child [:Restart] :delete-child [:Delete] nil)
+        go (when op (cs/may op simple (status c)))]
+    (if (and go (= :No (first go)))
+      [:reply [:error (second go)] st]
+      (case (first req)
+        :terminate-child
+        (if (or (= :temporary (:restart c)) simple)
+          (do (shutdown-child c) [:reply [:ok nil] (assoc st :children (drop-child cs (:key c)))])
+          [:reply [:ok nil] (assoc st :children (put-child cs (assoc (shutdown-child c) :restarting false)))])
+        :restart-child
+        (let [outcome (launch c)
+              kept (cs/after-start (:strategy flags) (:restart c) outcome)]
+          [:reply (cs/start-reply outcome)
+           (case (first kept)
+             :Add (assoc st :children (put-child cs (assoc c :actor (second kept))))
+             :Skip (assoc st :children (drop-child cs (:key c)))
+             st)])
+        :delete-child [:reply [:ok nil] (assoc st :children (drop-child cs (:key c)))]
+        :which-children [:reply [:ok (mapv (fn [c] (assoc (info c) :actor (cs/shown (status c) (:actor c)))) cs)] st]
+        :count-children [:reply [:ok {:specs (if simple 1 (count cs))
+                                      :active (count (filter :actor cs))
+                                      :supervisors (count (filter #(= :supervisor (:type %)) cs))
+                                      :workers (count (filter #(= :worker (:type %)) cs))}]
+                         st]))))
+
 (defrecord Supervisor [flags specs]
   gs/Server
   (init [_]
     (if (simple? flags)
-      {:children [] :restarts [] :template (first specs) :next 0}
-      (let [cs (reduce (fn [cs spec]
-                         (let [r (start-child (child-of spec (:id spec) []))]
-                           (if (= :ok (first r))
-                             (conj cs (second r))
-                             (do (stop-all cs)
-                                 (throw (ex-info "supervisor failed to start a child"
-                                                 {:reason [:shutdown [:failed-to-start-child (:id spec) (second r)]]}))))))
-                       [] specs)]
-        {:children cs :restarts []})))
+      [:ok {:children [] :restarts [] :template (first specs) :next 0}]
+      (let [cs (start-all (:strategy flags) specs)]
+        (if (= :failed (first cs))
+          [:stop [:shutdown [:failed-to-start-child (nth cs 1) (nth cs 2)]]]
+          [:ok {:children cs :restarts []}]))))
   (handle-call [_ req _ st]
-    (let [cs (:children st)
-          x (second req)
-          c (find-child flags cs x)]
+    (let [c (find-child flags (:children st) (second req))]
       (case (first req)
-        :start-child (handle-start-child flags st x)
-        :terminate-child
-        (cond
-          (nil? c) [:reply [:error :not-found] st]
-          (or (= :temporary (:restart c)) (simple? flags))
-          (do (shutdown-child c) [:reply [:ok nil] (assoc st :children (drop-child cs (:key c)))])
-          :else [:reply [:ok nil] (assoc st :children (put-child cs (shutdown-child c)))])
-        :restart-child
-        (cond
-          (simple? flags) [:reply [:error :simple-one-for-one] st]
-          (nil? c) [:reply [:error :not-found] st]
-          (:actor c) [:reply [:error :running] st]
-          :else (let [r (start-child c)]
-                  (if (= :ok (first r))
-                    [:reply [:ok (:actor (second r))] (assoc st :children (put-child cs (second r)))]
-                    [:reply r st])))
-        :delete-child
-        (cond
-          (simple? flags) [:reply [:error :simple-one-for-one] st]
-          (nil? c) [:reply [:error :not-found] st]
-          (:actor c) [:reply [:error :running] st]
-          :else [:reply [:ok nil] (assoc st :children (drop-child cs (:key c)))])
+        :start-child (handle-start-child flags st (second req))
         :get-childspec
         (cond
           (and (simple? flags) c) [:reply [:ok (spec-of (:template st))] st]
           (nil? c) [:reply [:error :not-found] st]
           :else [:reply [:ok (spec-of c)] st])
-        :which-children [:reply [:ok (mapv info cs)] st]
-        :count-children [:reply [:ok {:specs (if (simple? flags) 1 (count cs))
-                                      :active (count (filter :actor cs))
-                                      :supervisors (count (filter #(= :supervisor (:type %)) cs))
-                                      :workers (count (filter #(= :worker (:type %)) cs))}]
-                         st])))
+        (child-call flags st req))))
   (handle-cast [_ _ st] [:noreply st])
   (handle-info [_ msg st]
     (cond
@@ -236,7 +265,7 @@
 
       (and (vector? msg) (= ::retry (first msg)))
       (if-let [c (by-key (:children st) (second msg))]
-        (if (:actor c) [:noreply st] (child-exited flags st c :start-failed))
+        (if (:restarting c) (child-exited flags st c :start-failed) [:noreply st])
         [:noreply st])
 
       :else [:noreply st]))
@@ -281,8 +310,8 @@
 (defn start-child!
   "Start a child from spec and add it, or, under a :simple-one-for-one
   supervisor, from its template with the extra args (a vector).  Returns
-  the child actor (nil if its start ignored).  Throws if the spec is bad,
-  the id is taken or the start fails."
+  the child actor, or nil if its start ignored (OTP's {ok, undefined}).
+  Throws if the spec is bad, the id is taken or the start fails."
   [sup spec-or-args]
   (result (gs/call! sup [:start-child spec-or-args] nil)))
 
@@ -314,7 +343,8 @@
 
 (defn which-children
   "The children, in start order: [{:id :actor :type :restart}], :actor nil
-  for a child that is not running, :id nil for a dynamic child."
+  for a child with no process (OTP's undefined) and :restarting for one
+  being restarted, :id nil for a dynamic child."
   [sup]
   (result (gs/call! sup [:which-children])))
 
@@ -326,7 +356,8 @@
 (defn child
   "The running actor of child id, or nil."
   [sup id]
-  (:actor (first (filter #(= id (:id %)) (which-children sup)))))
+  (let [a (:actor (first (filter #(= id (:id %)) (which-children sup))))]
+    (when (act/pid? a) a)))
 
 (defn stop!
   "Stop the supervisor: its children stop in reverse start order, then it

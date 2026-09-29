@@ -12,7 +12,8 @@
 (defn- timeout-ms [t] (if (= :infinity t) nil t))
 
 (defn- action-kind
-  "The kind of one action: :postpone, :next-event, :reply, :timer, or :bad."
+  "The kind of one action: :postpone, :next-event, :reply, :timer,
+  :hibernate, or :bad."
   [a]
   (cond
     (= :postpone a) :postpone
@@ -21,12 +22,32 @@
     (and (vector? a) (= :reply (first a)) (= 3 (count a))) :reply
     (and (vector? a) (contains? #{:timeout :state-timeout} (first a)) (= 3 (count a))) :timer
     (and (vector? a) (= :generic-timeout (first a)) (= 4 (count a))) :timer
+    (= :hibernate a) :hibernate
+    (and (vector? a) (= :hibernate (first a)) (= 2 (count a))) :hibernate
     :else :bad))
 
 (defn- enter-ok?
   "An enter call may not postpone or insert events."
   [actions]
   (not-any? (fn [a] (contains? #{:postpone :next-event} (action-kind a))) actions))
+
+(defn init-of
+  "What init's ret means: [:Start state data actions], [:Ignore], or
+  [:Fail reason exit], start failing with reason and the process exiting
+  with exit.  init returns [:ok state data], [:ok state data actions],
+  [:stop reason], [:error reason] or :ignore; anything else fails with
+  [:bad-return-value ret]."
+  [ret]
+  (let [n (if (vector? ret) (count ret) 0)
+        tag (when (pos? n) (first ret))
+        bad [:bad-return-value ret]]
+    (cond
+      (= :ignore ret) [:Ignore]
+      (and (= :ok tag) (= 3 n)) [:Start (nth ret 1) (nth ret 2) []]
+      (and (= :ok tag) (= 4 n) (actions? (nth ret 3))) [:Start (nth ret 1) (nth ret 2) (nth ret 3)]
+      (and (= :stop tag) (= 2 n)) [:Fail (nth ret 1) (nth ret 1)]
+      (and (= :error tag) (= 2 n)) [:Fail (nth ret 1) :normal]
+      :else [:Fail bad bad])))
 
 (defn result-of
   "What a callback's return ret means, given the current state and data.
@@ -77,6 +98,16 @@
               [:Actions p ins reps tms]))
           [:Actions false [] [] []]
           actions))
+
+(defn hibernate?
+  "Do actions ask to hibernate before the next event?  :hibernate or
+  [:hibernate bool]; the last of them decides."
+  [actions]
+  (reduce (fn [h a]
+            (if (= :hibernate (action-kind a))
+              (if (vector? a) (boolean (second a)) true)
+              h))
+          false actions))
 
 (defn next-queues
   "The postponed events and the event queue after handling event.  changed?

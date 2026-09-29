@@ -66,7 +66,7 @@
 (defrecord Manager [initial]
   gs/Server
   (init [_]
-    (reduce (fn [hs [id h]] (second (add hs id h nil))) [] initial))
+    [:ok (reduce (fn [hs [id h]] (second (add hs id h nil))) [] initial)])
   (handle-call [_ req _ hs]
     (case (first req)
       :add (let [[_ id h owner] req

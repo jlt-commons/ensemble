@@ -46,7 +46,7 @@
 
 (defrecord Counter []
   gs/Server
-  (init [_] 0)
+  (init [_] [:ok 0])
   (handle-call [_ req _ st] (case req :inc [:reply (inc st) (inc st)]))
   (handle-cast [_ _ st] [:noreply st])
   (handle-info [_ _ st] [:noreply st])

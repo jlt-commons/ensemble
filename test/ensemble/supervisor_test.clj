@@ -193,7 +193,7 @@
 
 (defrecord Terminator [log id]
   gs/Server
-  (init [_] nil)
+  (init [_] [:ok nil])
   (handle-call [_ _ _ st] [:reply :ok st])
   (handle-cast [_ _ st] [:noreply st])
   (handle-info [_ _ st] [:noreply st])
@@ -335,4 +335,71 @@
     (sup/terminate-child! s :a)
     (sleep 50)
     (is (act/alive? s) "the supervisor stopped it, so it is no shutdown of its own")
+    (sup/stop! s)))
+
+;; --- children that start no process -----------------------------------------
+
+(defrecord Ignorer []
+  gs/Server
+  (init [_] :ignore)
+  (handle-call [_ _ _ st] [:reply nil st])
+  (handle-cast [_ _ st] [:noreply st])
+  (handle-info [_ _ st] [:noreply st])
+  (handle-timeout [_ st] [:noreply st])
+  (terminate [_ _ _] nil))
+
+(deftest an-ignored-child-keeps-its-spec-with-no-process
+  (let [log (atom [])
+        s (sup/start {} [{:id :i :start #(gs/start-link (->Ignorer))}
+                         {:id :a :start (worker log :a)}])]
+    (is (= [{:id :i :actor nil :type :worker :restart :permanent}]
+           (filterv #(= :i (:id %)) (sup/which-children s))))
+    (is (= {:specs 2 :active 1 :supervisors 0 :workers 2} (sup/count-children s)))
+    (testing "restart-child! can start it later"
+      (is (nil? (sup/restart-child! s :i)) "it ignores again, and stays without a process"))
+    (testing "and it can be deleted, since it is not running"
+      (is (= :ok (sup/delete-child! s :i)))
+      (is (= [:a] (ids s))))
+    (sup/stop! s)))
+
+(deftest an-ignored-temporary-child-is-not-kept
+  (let [s (sup/start {} [{:id :t :restart :temporary :start (constantly :ignore)}])]
+    (is (= [] (sup/which-children s)))
+    (sup/stop! s)))
+
+(deftest start-child-of-an-ignoring-spec-answers-nil
+  (let [s (sup/start {} [])]
+    (is (nil? (sup/start-child! s {:id :i :start (constantly :ignore)})))
+    (is (= [:i] (ids s)))
+    (is (= :already-present
+           (try (sup/start-child! s {:id :i :start (constantly :ignore)})
+                (catch Throwable e (:reason (ex-data e))))))
+    (sup/stop! s)))
+
+(deftest a-simple-one-for-one-child-that-ignores-is-not-added
+  (let [s (sup/start {:strategy :simple-one-for-one} [{:id :tpl :start (fn [_] :ignore)}])]
+    (is (nil? (sup/start-child! s [1])))
+    (is (= [] (sup/which-children s)))
+    (sup/stop! s)))
+
+(deftest a-child-start-may-answer-as-otp-does
+  (let [log (atom [])
+        s (sup/start {} [])]
+    (is (act/alive? (sup/start-child! s {:id :ok :start (fn [] [:ok ((worker log :ok))])})))
+    (is (= :nope (try (sup/start-child! s {:id :err :start (constantly [:error :nope])})
+                      (catch Throwable e (:reason (ex-data e))))))
+    (is (= :what (try (sup/start-child! s {:id :bad :start (constantly :what)})
+                      (catch Throwable e (:reason (ex-data e))))))
+    (sup/stop! s)))
+
+(deftest an-ignoring-restart-leaves-the-child-without-a-process
+  (let [n (atom 0)
+        s (sup/start {:intensity 5}
+                     [{:id :c :start (fn [] (if (= 1 (swap! n inc))
+                                              (act/spawn-link (fn [] (receive [:die (act/exit! :boom)])))
+                                              :ignore))}])]
+    (act/! (sup/child s :c) :die)
+    (is (eventually #(= 2 @n)))
+    (is (eventually #(= [{:id :c :actor nil :type :worker :restart :permanent}] (sup/which-children s))))
+    (is (act/alive? s))
     (sup/stop! s)))

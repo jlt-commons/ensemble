@@ -4,7 +4,8 @@
 
   A machine is a record implementing Machine:
 
-      (init this)  -> [state data] or [state data actions]
+      (init this)  -> [:ok state data], [:ok state data actions], [:stop reason],
+                      [:error reason] or :ignore
       (handle-event this type content state data)  -> a result
       (terminate this reason state data)
 
@@ -23,10 +24,11 @@
   [:reply from value] action or with reply!."
   (:require [ensemble.actor :as act :refer [receive]]
             [ensemble.gen-server :as gs]
-            [ensemble.statem :as sm]))
+            [ensemble.statem :as sm]
+            [ensemble.timer :as timer]))
 
 (defprotocol Machine
-  (init [this] "Return [state data] or [state data actions].")
+  (init [this] "Return [:ok state data], [:ok state data actions], [:stop reason], [:error reason] or :ignore.")
   (handle-event [this type content state data] "Return a gen_statem result.")
   (terminate [this reason state data] "Run once as the machine stops."))
 
@@ -59,9 +61,12 @@
            [[::gs/cast request] [:event [:cast request]]]
            [[::gs/stop reason] [:stop reason]]
            [[:EXIT from reason] :when (and (some? parent) (= from parent)) [:stop reason]]
+           [[::wake] [:wake]]
            [:after wait [:timer k content]]
            [msg [:event [:info msg]]])]
     (case (first m)
+      ;; the timer that woke a hibernating machine for its next timeout
+      :wake (recur parent st)
       :stop [m st]
       :event [m st]
       :timer (let [[_ k content] m
@@ -95,36 +100,54 @@
             ;; the event timeout only runs while nothing is waiting to be handled
             timers (if (seq queue) (dissoc timers :event) timers)
             st* (assoc st :state state :data data :postponed postponed :queue queue
-                       :timers timers :deadlines (arm (set (map first timeouts)) timers (:deadlines st)))]
+                       :timers timers :deadlines (arm (set (map first timeouts)) timers (:deadlines st))
+                       :hibernate (sm/hibernate? actions))]
         (doseq [[from v] replies] (reply! from v))
         (if (and changed? (:state-enter opts))
           (transition! m opts st* [:enter (:state st)] :enter)
           st*)))))
 
+(declare run-loop)
+
+(defn- hibernate!
+  "Hibernate before waiting for the next event: the stack goes, and the
+  next message -- or a timer set to the earliest timeout, which a
+  hibernating machine must still see -- runs the loop again."
+  [m opts parent st]
+  (when-let [deadline (first (sort (map first (vals (:deadlines st)))))]
+    (timer/send-after (max 0 (- deadline (now))) (act/self) [::wake]))
+  (act/hibernate! run-loop m opts parent (dissoc st :hibernate)))
+
 (defn- run-loop [m opts parent st]
   (loop [st st]
     (if-let [event (first (:queue st))]
       (recur (transition! m opts (update st :queue (comp vec rest)) event :event))
-      (let [[msg st] (next-event-of parent st)]
+      (let [_ (when (:hibernate st) (hibernate! m opts parent st))
+            [msg st] (next-event-of parent st)]
         (if (= :stop (first msg))
           (finish m (second msg) st)
           (recur (transition! m opts st (second msg) :event)))))))
 
 (defn- run [m opts parent ack]
-  (let [r (try (init m)
-               (catch Throwable e
-                 (when parent (act/unlink! parent))
-                 (deliver ack [:error (act/reason-of e)])
-                 (act/exit! (act/reason-of e))))
-        [state data actions] r
-        st {:state state :data data :postponed [] :queue [] :timers {} :deadlines {}}
-        [_ _ inserted replies timeouts] (sm/actions-of (or actions []))
-        timers (sm/next-timers false {} timeouts)
-        st (assoc st :queue inserted :timers timers :deadlines (arm (set (map first timeouts)) timers {}))]
-    (doseq [[from v] replies] (reply! from v))
-    (deliver ack [:ok])
-    (let [st (if (:state-enter opts) (transition! m opts st [:enter state] :enter) st)]
-      (run-loop m opts parent st))))
+  (let [r (try (sm/init-of (init m))
+               (catch Throwable e (let [why (act/reason-of e)] [:Fail why why])))
+        quit! (fn [answer exit]
+                (when parent (act/unlink! parent))
+                (deliver ack answer)
+                (act/exit! exit))]
+    (case (first r)
+      :Ignore (quit! [:ignore] :normal)
+      :Fail (let [[_ why exit] r] (quit! [:error why] exit))
+      :Start
+      (let [[_ state data actions] r
+            st {:state state :data data :postponed [] :queue [] :timers {} :deadlines {}}
+            [_ _ inserted replies timeouts] (sm/actions-of actions)
+            timers (sm/next-timers false {} timeouts)
+            st (assoc st :queue inserted :timers timers :deadlines (arm (set (map first timeouts)) timers {}))]
+        (doseq [[from v] replies] (reply! from v))
+        (deliver ack [:ok])
+        (let [st (if (:state-enter opts) (transition! m opts st [:enter state] :enter) st)]
+          (run-loop m opts parent st))))))
 
 (defn- start* [m {:keys [name trap] :as opts} link?]
   (let [ack (promise)
@@ -133,8 +156,9 @@
         hook (act/on-exit! a (fn [reason] (deliver ack [:error reason])))
         r @ack]
     (act/cancel-exit! a hook)
-    (if (= :ok (first r))
-      a
+    (case (first r)
+      :ok a
+      :ignore :ignore
       (throw (ex-info (str "gen-statem init failed: " (pr-str (second r))) {:reason (second r)})))))
 
 (defn start

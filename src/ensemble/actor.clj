@@ -35,6 +35,9 @@
   pids."
   (:require [clojure.core.async :as a]
             [jolt.fibers :as fib]
+            [jolt.fs :as fs]
+            [jolt.image :as image]
+            [ensemble.life :as life]
             [ensemble.process :as proc]
             [ensemble.pattern :as pattern]
             [ensemble.select :as select]
@@ -188,14 +191,21 @@
 
 ;; sending --------------------------------------------------------------
 
-(defn- ring! [actor] (a/offer! (::bell actor) true))
+(declare wake!)
+
+(defn- ring!
+  "Tell actor something arrived: event is [:Mail] or [:Signal].  A
+  hibernated actor wakes."
+  [actor event]
+  (a/offer! (::bell actor) true)
+  (wake! actor event))
 
 (defn- enqueue!
   "Append msg to the actor's mailbox.  A message to a dead actor is dropped."
   [actor msg]
   (when (alive? actor)
     (swap! (::inbox actor) conj msg)
-    (ring! actor)))
+    (ring! actor [:Mail])))
 
 (defn !
   "Send msg to dest, a process (on this node or another), a registered
@@ -232,7 +242,7 @@
   [actor reason]
   (let [[old _] (swap-vals! (::life actor) (fn [l] (if (= :live l) [:dying reason] l)))]
     (when (= :live old)
-      (fib/interrupt! @(::fiber actor) (exit-ex reason)))))
+      (when-let [f @(::fiber actor)] (fib/interrupt! f (exit-ex reason))))))
 
 (defn- dying-of
   "The reason actor was killed with, or nil."
@@ -247,7 +257,7 @@
   [actor s]
   (when (alive? actor)
     (swap! (::signals actor) conj s)
-    (ring! actor)
+    (ring! actor [:Signal])
     (when (and (not= (:from s) actor)
                (or (not= :link (:kind s)) (not (:checked s)) (linked-to? actor (:from s))))
       (let [act (sig/on-signal @(::trapping actor) (:kind s) (:reason s) false)]
@@ -454,6 +464,187 @@
       (proc/-signal other me :link reason true))
     (doseq [[_ notify] mons] (notify reason))))
 
+(defn- hibernation
+  "What a hibernate! or passivate! throwable carries, {:resume [f args]
+  :disk? bool}, or nil."
+  [e]
+  (when-let [r (::hibernate (ex-data e))] {:resume r :disk? (boolean (::disk? (ex-data e)))}))
+
+(declare park!)
+
+(defn- run-fiber!
+  "Run (body) as actor me on a new fiber.  When it hibernates, me parks;
+  otherwise me has exited, and settles: its links and monitors are told,
+  and join sees how."
+  [me body]
+  (fib/spawn
+   (fn []
+     (binding [*actor* me]
+       ;; the body runs interruptible; what follows it -- telling the
+       ;; links and monitors -- must not be torn by a late kill, so it
+       ;; runs masked, and a kill arriving then is simply too late
+       (fib/masked
+        (fn []
+          ;; a kill interrupts only a fiber that is here: one that arrives
+          ;; sooner is found by drain-signals! below
+          (reset! (::fiber me) (fib/current-fiber))
+          (let [r (try
+                     (fib/unmasked (fn [] (drain-signals! me) {:ok (body)}))
+                     (catch Throwable e
+                       (if-let [h (and (not (dying-of me)) (hibernation e))] {:hibernate h} {:err e})))]
+             (if-let [h (:hibernate r)]
+               (park! me (:resume h) (:disk? h))
+               (let [killed (dying-of me)
+                     reason (cond killed killed
+                                  (contains? r :ok) :normal
+                                  :else (reason-of (:err r)))]
+                 (swap! (::lifecycle me) life/step [:Exit])
+                 (settle! me reason)
+                 (deliver (::done me)
+                          (if (sig/normal? reason)
+                            [:ok (:ok r)]
+                            [:err (or (:err r) (exit-ex reason)) reason])))))))))))
+
+(def ^:dynamic *image-dir*
+  "Where a passivated process's image is written."
+  (str (System/getProperty "java.io.tmpdir")))
+
+(def ^:private ^:dynamic *passivating* false)
+
+(declare new-actor local-actor)
+
+(defn- shared-ref?
+  "A reference another process may share, which an image would copy
+  apart from it: an atom, a volatile, a promise, a future, a delay or a
+  channel.  A lazy seq is a value."
+  [x]
+  (and (not (instance? clojure.lang.ISeq x))
+       (or (instance? clojure.lang.IAtom x)
+           (instance? clojure.lang.Volatile x)
+           (instance? clojure.lang.IPending x)
+           (instance? clojure.core.async.impl.channels.ManyToManyChannel x))))
+
+;; while a process is passivated: a local actor it holds is written as its
+;; pid and read back as the live actor; a shared reference refuses
+(defonce ^:private image-handler
+  (image/register-handler!
+   (fn [x] (and *passivating* (or (actor? x) (shared-ref? x))))
+   (fn [x]
+     (if (actor? x)
+       {::pid-of (::pid x) ::node-of (::node x)}
+       (throw (ex-info (str "a shared reference cannot be passivated: " (type x))
+                       {::shared (str (type x))}))))
+   (fn [d]
+     (if (and (map? d) (contains? d ::pid-of))
+       (or (local-actor (::pid-of d))
+           ;; a process that has exited: a handle to a dead pid
+           (let [a (new-actor (::pid-of d) (::node-of d))]
+             (reset! (::links a) ::closed)
+             (reset! (::monitors a) ::closed)
+             (reset! (::lifecycle a) [:Dead])
+             (deliver (::done a) [:ok nil])
+             a))
+       (throw (ex-info "not an actor" {}))))))
+
+(defn- image-ref? [r] (and (vector? r) (= ::image (first r))))
+
+(defn- resume-of
+  "The [f args] to run from r: in memory, or read from its image, which
+  is then removed."
+  [r]
+  (if (image-ref? r)
+    (let [path (second r)
+          v (image/read-image path)]
+      (fs/delete-if-exists path)
+      v)
+    r))
+
+(defn- pending?
+  "Is there something for me to wake to: a message, a signal, a kill?"
+  [me]
+  (boolean (or (seq @(::inbox me)) (seq @(::saved me)) (seq @(::signals me)) (dying-of me))))
+
+(defn- wake!
+  "A message or a signal reached me: if it was hibernating, it runs again,
+  on a new fiber, from the fn it hibernated with -- read back from disk if
+  it was passivated.  A ring for a message the actor already took before
+  it hibernated wakes nothing: each sender rings after its message is in,
+  so the ring for one still waiting always sees it."
+  [me event]
+  (let [[old new] (if (pending? me)
+                    (swap-vals! (::lifecycle me) life/step event)
+                    [nil nil])]
+    (when (and (contains? #{[:Hibernated] [:Passivated]} old) (= [:Running] new))
+      ;; the waker takes the resume, so a passivation still writing sees
+      ;; it gone and removes its image
+      (let [[r _] (swap-vals! (::resume me) (constantly nil))]
+        (run-fiber! me (fn [] (let [[f args] (resume-of r)] (apply f args))))))))
+
+(defn- passivate-image!
+  "Write resume to an image and keep only the image in memory, if me is
+  still hibernating by then; nil if it could not be written."
+  [me resume]
+  (let [path (str *image-dir* "/ensemble-" (name (::node me)) "-" (::pid me) "-" (System/nanoTime) ".jimg")]
+    (when (try (binding [*passivating* true] (image/dump! path resume))
+               (reset! (::refused me) nil)
+               true
+               (catch Throwable e
+                 (fs/delete-if-exists path)
+                 (reset! (::refused me) (ex-message e))
+                 false))
+      (if (compare-and-set! (::resume me) resume [::image path])
+        (swap! (::lifecycle me) life/step [:Passivate])
+        (fs/delete-if-exists path))
+      path)))
+
+(defn- park!
+  "me hibernates with [f args]: its fiber ends, and it wakes on the next
+  message or signal -- at once if one is already waiting.  With disk?, what
+  it will run is written to an image too, and dropped from memory; a state
+  that cannot be written leaves it hibernating in memory."
+  [me resume disk?]
+  (reset! (::fiber me) nil)
+  (reset! (::resume me) resume)
+  (swap! (::lifecycle me) life/step [:Hibernate])
+  (if (pending? me)
+    (wake! me [:Mail])
+    (when disk? (passivate-image! me resume))))
+
+(defn hibernate!
+  "Hibernate the current actor, as erlang:hibernate/3: give up the call
+  stack and wait, alive -- pid, name, links, monitors and mailbox kept --
+  until a message or an exit signal arrives, then run (apply f args) with
+  the stack emptied.  Wakes at once if a message is already waiting.
+  Never returns.  The actor's exit is then that fn's."
+  [f & args]
+  (throw (ex-info "hibernate" {::hibernate [f args]})))
+
+(defn passivate!
+  "hibernate!, and write (apply f args) to disk: the process keeps only its
+  identity and mailbox in memory until a message or an exit signal wakes
+  it and reads it back.  A local actor in args is written as its pid.  A
+  shared reference -- an atom, a channel, a promise -- cannot be, and
+  leaves the process hibernating in memory instead.  Never returns."
+  [f & args]
+  (throw (ex-info "passivate" {::hibernate [f args] ::disk? true})))
+
+(defn hibernating?
+  "Is actor hibernating (in memory or on disk): alive, with no fiber,
+  waiting for a message?"
+  [actor]
+  (contains? #{[:Hibernated] [:Passivated]} @(::lifecycle actor)))
+
+(defn passivated?
+  "Is actor hibernating on disk?"
+  [actor]
+  (= [:Passivated] @(::lifecycle actor)))
+
+(defn passivation-refused
+  "Why actor's last passivation stayed in memory -- what in its state could
+  not be written, and where -- or nil."
+  [actor]
+  @(::refused actor))
+
 (defn- new-actor [pid node]
   (with-meta
     {::pid pid
@@ -469,7 +660,10 @@
      ::aliases (atom #{})
      ::state (atom nil)
      ::life (atom :live)
-     ::fiber (promise)
+     ::lifecycle (atom [:Running])
+     ::resume (atom nil)
+     ::refused (atom nil)
+     ::fiber (atom nil)
      ::trapping (atom false)}
     {:type ::actor}))
 
@@ -497,29 +691,7 @@
      (when (and link parent)
        (swap! (::links me) conj parent)
        (swap! (::links parent) (fn [ls] (if (open? ls) (conj ls me) ls))))
-     (deliver
-      (::fiber me)
-      (fib/spawn
-       (fn []
-         @go
-         (binding [*actor* me]
-           ;; the body runs interruptible; what follows it -- telling the
-           ;; links and monitors -- must not be torn by a late kill, so it
-           ;; runs masked, and a kill arriving then is simply too late
-           (fib/masked
-            (fn []
-              (let [r (try
-                        (fib/unmasked (fn [] (drain-signals! me) {:ok (f)}))
-                        (catch Throwable e {:err e}))
-                    killed (dying-of me)
-                    reason (cond killed killed
-                                 (contains? r :ok) :normal
-                                 :else (reason-of (:err r)))]
-                (settle! me reason)
-                (deliver (::done me)
-                         (if (sig/normal? reason)
-                           [:ok (:ok r)]
-                           [:err (or (:err r) (exit-ex reason)) reason])))))))))
+     (run-fiber! me (fn [] @go (f)))
      (deliver go true)
      me)))
 

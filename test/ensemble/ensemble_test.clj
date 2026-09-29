@@ -23,7 +23,7 @@
 
 (defrecord Echo []
   gs/Server
-  (init [_] nil)
+  (init [_] [:ok nil])
   (handle-call [_ req _ st] [:reply req st])
   (handle-cast [_ _ st] [:noreply st])
   (handle-info [_ _ st] [:noreply st])

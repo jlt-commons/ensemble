@@ -38,7 +38,9 @@
 (graph exit-signal
   {:start  [:reason :boom]
    :states {:reason Any, :die Dies, :deliver Delivers, :ignore Ignores}
-   :edges  {:reason {[on-signal Bool Kind _ Bool] #{:die :deliver :ignore}}}})
+   :edges  {:reason {[on-signal Bool Kind _ Bool] #{:die :deliver :ignore}}}
+   ;; what a signal does is where it ends
+   :final  [:die :deliver :ignore]})
 
 ;; --- the rules, one by one ----------------------------------------------
 

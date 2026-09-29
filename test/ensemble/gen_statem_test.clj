@@ -10,7 +10,7 @@
 ;; the gen_statem docs' code lock: the right digits unlock it for a while
 (defrecord CodeLock [code log]
   sm/Machine
-  (init [_] [:locked []])
+  (init [_] [:ok :locked []])
   (handle-event [_ type content state buttons]
     (when log (swap! log conj [state type content]))
     (case state
@@ -69,7 +69,7 @@
 
 (defrecord Steps [log]
   sm/Machine
-  (init [_] [:a nil [[:next-event :internal :boot]]])
+  (init [_] [:ok :a nil [[:next-event :internal :boot]]])
   (handle-event [_ type content state data]
     (swap! log conj [type content state])
     (cond
@@ -125,8 +125,61 @@
 
 (deftest a-bad-result-stops-the-machine
   (let [m (sm/start (reify sm/Machine
-                      (init [_] [:s nil])
+                      (init [_] [:ok :s nil])
                       (handle-event [_ _ _ _ _] :nonsense)
                       (terminate [_ _ _ _] nil)))]
     (gs/cast! m :x)
     (is (= [:bad-return-value :nonsense] (act/exit-reason m 1000)))))
+
+(defrecord InitM [ret]
+  sm/Machine
+  (init [_] (ret))
+  (handle-event [_ _ _ _ data] [:keep-state-and-data [[:reply-to-nobody]]])
+  (terminate [_ _ _ _] nil))
+
+(deftest statem-init-ignore-error-and-stop
+  (let [a (atom nil)]
+    (is (= :ignore (sm/start (->InitM (fn [] (reset! a (act/self)) :ignore)))))
+    (is (= :normal (act/exit-reason @a 1000))))
+  (let [a (atom nil)]
+    (is (= :nope (try (sm/start (->InitM (fn [] (reset! a (act/self)) [:error :nope])))
+                      (catch Throwable e (:reason (ex-data e))))))
+    (is (= :normal (act/exit-reason @a 1000))))
+  (let [a (atom nil)]
+    (is (= :nope (try (sm/start (->InitM (fn [] (reset! a (act/self)) [:stop :nope])))
+                      (catch Throwable e (:reason (ex-data e))))))
+    (is (= :nope (act/exit-reason @a 1000))))
+  (is (= [:bad-return-value [:s nil]]
+         (try (sm/start (->InitM (fn [] [:s nil]))) (catch Throwable e (:reason (ex-data e)))))))
+
+;; --- hibernation ------------------------------------------------------------
+
+(defn- eventually [pred]
+  (loop [i 0] (cond (pred) true (> i 200) false :else (do (sleep 10) (recur (inc i))))))
+
+(defrecord Napper [log]
+  sm/Machine
+  (init [_] [:ok :awake 0])
+  (handle-event [_ type content state n]
+    (swap! log conj [state type content])
+    (cond
+      (= :nap content) [:next-state :asleep n [:hibernate]]
+      (= :nap-with-timeout content) [:next-state :asleep n [:hibernate [:state-timeout 30 :ring]]]
+      (and (vector? type) (= :call (first type))) [:keep-state n [[:reply (second type) [state n]]]]
+      (= :state-timeout type) [:next-state :awake n]
+      :else [:keep-state-and-data]))
+  (terminate [_ _ _ _] nil))
+
+(deftest a-hibernate-action-hibernates-the-machine
+  (let [m (sm/start (->Napper (atom [])))]
+    (gs/cast! m :nap)
+    (is (eventually #(act/hibernating? m)))
+    (is (= [:asleep 0] (gs/call! m :where)) "a call wakes it, in its state")))
+
+(deftest a-hibernating-machine-still-sees-its-timeout
+  (let [log (atom [])
+        m (sm/start (->Napper log))]
+    (gs/cast! m :nap-with-timeout)
+    (is (eventually #(act/hibernating? m)))
+    (is (eventually #(some #{[:asleep :state-timeout :ring]} @log)) "the state timeout fired and woke it")
+    (is (= [:awake 0] (gs/call! m :where)))))

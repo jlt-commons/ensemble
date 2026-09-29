@@ -131,7 +131,7 @@
 
 (defrecord Counter []
   gs/Server
-  (init [_] 0)
+  (init [_] [:ok 0])
   (handle-call [_ req _ n] (case (first req) :add (let [n (+ n (second req))] [:reply n n]) :get [:reply n n]))
   (handle-cast [_ _ n] [:noreply n])
   (handle-info [_ _ n] [:noreply n])

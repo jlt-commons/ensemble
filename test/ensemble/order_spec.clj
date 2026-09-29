@@ -48,7 +48,14 @@
   {:states {:children (Vec (Tuple Nat Restart)), :plan Plan,
             :times (Vec Int), :allow Allowed, :exceed Exceeded}
    :edges  {:children {[restart-plan Strategy _ Nat] #{:plan}}
-            :times    {[intensity _ Int Nat Nat] #{:allow :exceed}}}})
+            ;; a restart is allowed while the restarts inside the period,
+            ;; this one counted, are at most the intensity
+            :times    {[intensity _ Int Nat Nat]
+                       {:to #{:allow}
+                        :when (fn [times now period max-r]
+                                (<= (inc (count (filter (fn [t] (<= (- now t) period)) times))) max-r))
+                        :else :exceed}}}
+   :final  [:plan :allow :exceed]})
 
 ;; --- the spec's vocabulary ----------------------------------------------
 

@@ -2,9 +2,12 @@
   "The OTP gen_server behaviour.  A server is a record implementing Server;
   start or start-link runs it as an actor, and clients use call! and cast!.
 
-  Starting is synchronous, as in OTP: start returns once init has returned,
-  and throws if init throws (the server then exits and a linked caller is
-  unlinked first, so it is not taken down).  start-link links the server to
+  Starting is synchronous, as in OTP: start returns once init has returned.
+  init returns [:ok state] or [:ok state action]; [:stop reason] and
+  [:error reason] make start throw {:reason reason}, and :ignore makes it
+  return :ignore.  A throw from init is [:stop the-throwable].  The server
+  then exits (with reason for :stop, :normal otherwise), and a linked caller
+  is unlinked first, so it is not taken down.  start-link links the server to
   the calling actor, its parent.  A server that traps exits and receives an
   exit signal from its parent terminates with the parent's reason; that is how
   a supervisor shuts a child down.
@@ -13,8 +16,9 @@
 
       [:reply reply state]  [:noreply state]  [:stop reason state] ...
 
-  each with an optional trailing timeout in ms, which runs handle-timeout if
-  no message arrives in time.  [:stop reason state] terminates the server:
+  each with an optional trailing action: a timeout in ms, which runs
+  handle-timeout if no message arrives in time; :hibernate; or [:continue
+  c], which runs handle-continue with c before another message is taken.  [:stop reason state] terminates the server:
   terminate runs, then the server exits with reason, which is what links,
   monitors and supervisors see.  A callback that throws does the same with
   the throwable as the reason.
@@ -25,14 +29,16 @@
   timed out is dropped.  A failed call throws ex-info whose data carries the
   :reason (:noproc, :timeout, :calling-self, or the server's exit reason)."
   (:require [ensemble.actor :as act :refer [receive]]
-            [ensemble.callback :as cb]))
+            [ensemble.callback :as cb]
+            [ensemble.request :as rq]))
 
 (defprotocol Server
-  (init [this] "Return the server's initial state.")
+  (init [this] "Return [:ok state], [:ok state action], [:stop reason], [:error reason] or :ignore.")
   (handle-call [this request from state] "Handle a call; return a tagged vector.")
   (handle-cast [this request state] "Handle a cast; return a tagged vector.")
   (handle-info [this msg state] "Handle any other message; return a tagged vector.")
   (handle-timeout [this state] "Run when a returned timeout elapses; return a tagged vector.")
+  (handle-continue [this c state] "Run for a returned [:continue c], before another message; return a tagged vector.")
   (terminate [this reason state] "Run once as the server stops, with the reason."))
 
 (def ^:dynamic *call-timeout*
@@ -97,6 +103,92 @@
                                (let [[k v] @p] (if (= :ok k) v (throw v))))
        :else                 (call-from-outside target request timeout-ms)))))
 
+;; --- asynchronous calls ------------------------------------------------------
+
+(defn send-request
+  "Send request to srv without waiting, as gen_server:send_request, and
+  return its request id, which check-response, wait-response and
+  receive-response take.  Run it in an actor: the reply comes to an alias
+  of it, and it monitors srv.  With a label and a collection (reqids-new),
+  adds the request to the collection and returns the collection."
+  ([srv request]
+   (let [target (try (act/resolve-dest srv) (catch Throwable _ nil))
+         alias (act/alias!)]
+     (if target
+       (let [mref (act/monitor! target)]
+         (act/! target [::call {:alias alias} request])
+         [:Req alias mref srv])
+       ;; a name nobody holds: the request fails as a call to a dead server
+       (let [mref (act/make-ref)]
+         (act/! (act/self) [:DOWN mref :process srv :noproc])
+         [:Req alias mref srv]))))
+  ([srv request label coll] (conj coll [(send-request srv request) label])))
+
+(defn- done! [[_ alias mref]]
+  (act/unalias! alias)
+  (act/demonitor! mref {:flush true}))
+
+(defn- response
+  "An answer as OTP gives it: [:reply r] or [:error [reason server]]."
+  [a]
+  (case (first a)
+    :Reply [:reply (second a)]
+    :Failed [:error [(nth a 1) (nth a 2)]]))
+
+(defn reqids-new "An empty request id collection." [] [])
+(defn reqids-add "coll with request id req under label." [req label coll] (conj coll [req label]))
+(defn reqids-size "How many requests coll holds." [coll] (count coll))
+(defn reqids-to-list "coll as [[req label] ...]." [coll] coll)
+
+(defn check-response
+  "What msg, a message just received, is to request req: [:reply r],
+  [:error [reason server]], or :no-reply.  With a collection and delete?:
+  [response label coll'], :no-request for an empty collection, or
+  :no-reply."
+  ([msg req]
+   (let [a (rq/answer msg req)]
+     (if (= :NoReply (first a)) :no-reply (do (done! req) (response a)))))
+  ([msg coll delete?]
+   (let [c (rq/check msg coll delete?)]
+     (case (first c)
+       :NoRequest :no-request
+       :NotOurs :no-reply
+       :Response (let [[_ a label req coll*] c]
+                   (when delete? (done! req))
+                   [(response a) label coll*])))))
+
+(defn- await-answer
+  "Wait up to timeout-ms (nil: for ever) for a message that answers.
+  [:msg m] or [:timeout]."
+  [answers? timeout-ms]
+  (receive
+   [m :when (answers? m) [:msg m]]
+   [:after timeout-ms [:timeout]]))
+
+(defn wait-response
+  "Wait up to timeout-ms for the answer to req: [:reply r], [:error
+  [reason server]], or :timeout, which keeps the request."
+  ([req timeout-ms]
+   (let [r (await-answer #(not= :NoReply (first (rq/answer % req))) timeout-ms)]
+     (if (= :timeout (first r)) :timeout (check-response (second r) req))))
+  ([coll timeout-ms delete?]
+   (if (empty? coll)
+     :no-request
+     (let [r (await-answer #(= :Response (first (rq/check % coll delete?))) timeout-ms)]
+       (if (= :timeout (first r)) :timeout (check-response (second r) coll delete?))))))
+
+(defn receive-response
+  "wait-response, but a timeout abandons the request (every request of
+  the collection): a late answer is dropped."
+  ([req timeout-ms]
+   (let [r (wait-response req timeout-ms)]
+     (when (= :timeout r) (done! req))
+     r))
+  ([coll timeout-ms delete?]
+   (let [r (wait-response coll timeout-ms delete?)]
+     (when (= :timeout r) (run! (fn [[req _]] (done! req)) coll))
+     r)))
+
 (defn cast!
   "Send request to srv without waiting.  Never fails, even when the server is
   not running (as OTP's cast).  Returns :ok."
@@ -122,48 +214,79 @@
       :call    (cb/interpret :call (handle-call server (nth m 2) (nth m 1) st))
       :cast    (cb/interpret :other (handle-cast server (nth m 1) st))
       :timeout (cb/interpret :other (handle-timeout server st))
+      :continue (cb/interpret :other (handle-continue server (nth m 1) st))
       :info    (cb/interpret :other (handle-info server (nth m 1) st)))
     (catch Throwable e [:Crash (crash-reason e)])))
 
-(defn- run-loop [server parent st timeout]
-  (loop [st st, t timeout]
-    (let [m (receive
-             [[::call from request] [:call from request]]
-             [[::cast request] [:cast request]]
-             [[::stop reason] [:stop reason]]
-             [[:EXIT from reason] :when (and (some? parent) (= from parent)) [:parent reason]]
-             [:after t [:timeout]]
-             [msg [:info msg]])]
+(defn- next-message
+  "What the server handles next, once a callback asked for [:Wait t] or
+  [:Cont c]: a pending continue before anything in the mailbox, else the
+  next message, or [:timeout] when t elapses first.  With no t and a
+  hibernate-after, [:idle] when that long passes with no message."
+  [parent next hibernate-after]
+  (case (first next)
+    :Cont [:continue (second next)]
+    (let [t (second next)]
+      (receive
+       [[::call from request] [:call from request]]
+       [[::cast request] [:cast request]]
+       [[::stop reason] [:stop reason]]
+       [[:EXIT from reason] :when (and (some? parent) (= from parent)) [:parent reason]]
+       [:after (or t hibernate-after) (if t [:timeout] [:idle])]
+       [msg [:info msg]]))))
+
+(defn- run-loop
+  "Serve until the server stops.  A :hibernate action, or idle ms with no
+  message, hibernates the process: its stack goes, and the next message
+  runs this again.  idle is {:after ms :disk? bool}; with :disk? an idle
+  server is passivated, kept on disk until its next message."
+  [server parent st next idle]
+  (loop [st st, next next]
+    (when (= :Hibernate (first next))
+      (act/hibernate! run-loop server parent st [:Wait nil] idle))
+    (let [m (next-message parent next (:after idle))]
       (case (first m)
+        :idle   (if (:disk? idle)
+                  (act/passivate! run-loop server parent st [:Wait nil] idle)
+                  (act/hibernate! run-loop server parent st [:Wait nil] idle))
         :stop   (finish server (second m) st)
         :parent (finish server (second m) st)
         (let [step (dispatch server st m)]
           (case (first step)
-            :Reply    (do (reply! (second m) (nth step 1))
-                          (recur (nth step 2) (nth step 3)))
-            :Continue (recur (nth step 1) (nth step 2))
-            :Stop     (let [[_ reason reply? reply st*] step]
-                        (when reply? (reply! (second m) reply))
-                        (finish server reason st*))
-            :Bad      (finish server [:bad-return-value (nth step 1)] st)
-            :Crash    (let [reason (nth step 1)]
-                        (terminate server reason st)
-                        (act/exit! reason))))))))
+            :Reply   (do (reply! (second m) (nth step 1))
+                         (recur (nth step 2) (nth step 3)))
+            :NoReply (recur (nth step 1) (nth step 2))
+            :Stop    (let [[_ reason reply? reply st*] step]
+                       (when reply? (reply! (second m) reply))
+                       (finish server reason st*))
+            :Bad     (finish server [:bad-return-value (nth step 1)] st)
+            :Crash   (let [reason (nth step 1)]
+                       (terminate server reason st)
+                       (act/exit! reason))))))))
 
-(defn- run [server parent ack timeout]
-  (let [st (try (init server)
-                (catch Throwable e
-                  (when parent (act/unlink! parent))
-                  (deliver ack [:error (act/reason-of e)])
-                  (act/exit! (act/reason-of e))))]
-    (deliver ack [:ok])
-    (run-loop server parent st timeout)))
+(defn- run [server parent ack timeout idle]
+  (let [r (try (cb/interpret-init (init server))
+               (catch Throwable e (let [why (act/reason-of e)] [:Fail why why])))
+        quit! (fn [answer exit]
+                (when parent (act/unlink! parent))
+                (deliver ack answer)
+                (act/exit! exit))]
+    (case (first r)
+      :Start  (let [[_ st next] r]
+                (deliver ack [:ok])
+                ;; a :timeout start option arms a timeout when init set none
+                (run-loop server parent st (if (and timeout (= [:Wait nil] next)) [:Wait timeout] next)
+                          idle))
+      :Ignore (quit! [:ignore] :normal)
+      :Fail   (let [[_ why exit] r] (quit! [:error why] exit)))))
 
-(defn- start* [server {:keys [name timeout trap]} link?]
+(defn- start* [server {:keys [name timeout trap hibernate-after passivate-after]} link?]
   (let [ack (promise)
         parent (when link? (act/self))
         srv (try
-              (act/spawn (fn [] (run server parent ack timeout))
+              (act/spawn (fn [] (run server parent ack timeout
+                                     (cond passivate-after {:after passivate-after :disk? true}
+                                           hibernate-after {:after hibernate-after :disk? false})))
                          {:name name :link link? :trap trap})
               (catch Throwable e
                 (if-let [holder (and name (act/whereis name))]
@@ -173,21 +296,26 @@
         hook (act/on-exit! srv (fn [reason] (deliver ack [:error reason])))
         r @ack]
     (act/cancel-exit! srv hook)
-    (if (= :ok (first r))
-      srv
+    (case (first r)
+      :ok srv
+      :ignore :ignore
       (throw (ex-info (str "gen-server init failed: " (pr-str (second r)))
                       {:reason (second r)}
                       (when (instance? Throwable (second r)) (second r)))))))
 
 (defn start
-  "Start server as a new actor, returning it once init has returned.  Throws
-  if init throws, or if :name is taken ({:reason [:already-started actor]}).
+  "Start server as a new actor, returning it once init has returned, or
+  :ignore when init returned :ignore.  Throws {:reason r} if init failed
+  with r, or if :name is taken ({:reason [:already-started actor]}).
   Options:
 
       :name     register the server under this name
       :timeout  a timeout armed before the first message, as a callback's
       :trap     trap exits from the start (a server that must terminate
-                cleanly when its parent stops it traps exits)"
+                cleanly when its parent stops it traps exits)
+      :hibernate-after  hibernate after this many ms with no message, as
+                OTP's hibernate_after
+      :passivate-after  the same, to disk (see ensemble.actor/passivate!)"
   ([server] (start server {}))
   ([server opts] (start* server opts false)))
 

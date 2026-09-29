@@ -33,6 +33,23 @@ message to a dead actor is dropped, and a message to an unregistered name
 throws, as `Name ! Msg` does. `spawn` takes `:name`, `:link` (spawn_link),
 `:trap` and `:state`; `spawn-link` and `spawn-monitor` are the OTP shapes.
 
+`(act/hibernate! f & args)` is `erlang:hibernate/3`. The process gives up
+its fiber and call stack, but stays alive with its pid, name, links,
+monitors and mailbox. The next message or exit signal runs `(apply f
+args)` on a new fiber, and a message that's already waiting wakes it at
+once. `hibernating?` tells whether a process is hibernating.
+
+`(act/passivate! f & args)` goes a step beyond Erlang and hibernates to
+disk. What the process will run next is written with `jolt.image`, and
+only its identity and mailbox stay in memory. The next message or signal
+reads the image back, removes the file and resumes, exactly as for
+`hibernate!`. A local actor in the state is written as its pid and comes
+back as the live actor. A reference the process might share with others
+(an atom, a channel, a promise) can't be written without splitting it
+from them. In that case the process stays hibernated in memory, and
+`passivation-refused` says why. gen_server's `:passivate-after` start
+option passivates a server after that many ms without a message.
+
 ### Receive
 
 `receive` is Erlang's selective receive: the oldest message some clause takes
@@ -99,7 +116,7 @@ such as a test or the REPL.
 
 (defrecord Counter []
   gs/Server
-  (init [_] 0)
+  (init [_] [:ok 0])
   (handle-call [_ req _from n]
     (case (first req)
       :add (let [n (+ n (second req))] [:reply n n])
@@ -113,12 +130,17 @@ such as a test or the REPL.
 (gs/call! :counter [:add 3]) ;=> 3
 ```
 
-- `start` and `start-link` are synchronous: they return once `init` has, and
-  throw if it throws. A failed `start-link` does not take its caller down.
+- `init` returns OTP's shapes: `[:ok st]`, `[:ok st action]`, `[:stop
+  reason]`, `[:error reason]` or `:ignore`. `start` and `start-link` are
+  synchronous: they return the server once `init` has, return `:ignore` for
+  `:ignore`, and throw `{:reason r}` for a stop, an error, a throw or a bad
+  return. The process then exits (`:normal` for `:error` and `:ignore`), and
+  a failed `start-link` does not take its caller down.
 - The callbacks return OTP's shapes: `[:reply r st]`, `[:noreply st]`,
-  `[:stop reason st]`, `[:stop reason reply st]`, each optionally with a
-  timeout (ms or `:infinity`). Anything else stops the server with
-  `[:bad-return-value ret]`.
+  `[:stop reason st]`, `[:stop reason reply st]`, each optionally with an
+  action: a timeout (ms or `:infinity`), `:hibernate`, or `[:continue c]`,
+  which runs `handle-continue` with `c` before the server takes another
+  message. Anything else stops the server with `[:bad-return-value ret]`.
 - `[:stop reason st]` runs `terminate` and exits with `reason`, which is what
   links, monitors and supervisors see. A callback that throws does the same,
   with the throwable as the reason.
@@ -130,6 +152,10 @@ such as a test or the REPL.
   with the parent's reason. That is how a supervisor stops it cleanly.
 - `stop!` stops a server and waits for it. `reply!` answers a call later,
   from anywhere.
+- A `:hibernate` action hibernates the server until its next message, and
+  the `:hibernate-after` start option does the same after that many ms
+  without one. In gen_statem, `:hibernate` is a transition action, and a
+  hibernating machine still gets its timeouts.
 
 ## gen_statem
 
@@ -143,7 +169,7 @@ callback, `(handle-event this type content state data)`, sees every event:
 
 (defrecord Door []
   sm/Machine
-  (init [_] [:locked nil])
+  (init [_] [:ok :locked nil])
   (handle-event [_ type content state data]
     (case [state type]
       [:locked :cast]        [:next-state :open data [[:state-timeout 1000 :lock]]]
@@ -226,6 +252,30 @@ If the tree exits on its own, the type decides what happens next. A
 or a `:transient` one that exited abnormally, stops every other application,
 where OTP would stop the node.
 
+## Timers
+
+```clojure
+(require '[ensemble.timer :as timer])
+
+(def ref (timer/send-after 1000 (act/self) :wake-up))   ; erlang:send_after
+(timer/start-timer 500 :worker :tick)                   ; sends [:timeout ref :tick]
+(timer/cancel-timer ref)                                ; ms left, or false
+(timer/send-interval 100 :tick)                         ; timer:send_interval to self
+```
+
+- A timer to a pid is cancelled when that process exits. A timer to a
+  name looks the name up when it fires, and its message is dropped if no
+  process holds the name.
+- `cancel-timer` and `read-timer` answer the time left, or `false` once
+  the timer has fired or been cancelled. `{:async true}` answers with a
+  `[:cancel-timer ref left]` message instead. `{:abs true}` takes a
+  `monotonic-time` deadline.
+- `apply-after`, `send-interval`, `apply-interval`, `exit-after`,
+  `kill-after` and `cancel` are the `timer` module's. An interval fires at
+  fixed deadlines, and ends when the process that started it exits.
+- Each node has one timer server, started on first use, and every
+  decision it makes is in `ensemble.timers`.
+
 ## Distribution
 
 A process handle is anything that implements `ensemble.process/Process`:
@@ -276,6 +326,7 @@ process or on another machine.
   it catches still kills it at its next receive. The bookkeeping of a dying
   process -- telling its links and monitors -- runs masked, so a late
   signal cannot tear it.
+- **Passivation is an extension.** Erlang's hibernation stays in memory.
 - **Distribution has only the loopback transport so far**, with no
   cookies and no global name registry. There is also no hot code loading, no `sys` suspend/resume, and no
   reductions (jolt preempts fibers on a timer instead).
@@ -294,13 +345,16 @@ written from the Erlang/OTP documentation:
 | `ensemble.signal` | what an exit signal does to a process | `signal_spec` |
 | `ensemble.select`, `ensemble.match`, `ensemble.pattern` | which message a receive takes, how a pattern binds | `select_spec`, `match_spec`, `pattern_spec` |
 | `ensemble.order` | restart types, strategy plans, restart intensity, auto-shutdown | `order_spec` |
-| `ensemble.childspec` | which supervisor flags and child specs are valid, with their defaults | `childspec_spec` |
+| `ensemble.childspec` | which supervisor flags and child specs are valid, with their defaults; what an ignored start keeps; which child operations are allowed | `childspec_spec` |
+| `ensemble.timers` | when timers fire and in what order, what a cancel answers, which timers an exit ends | `timers_spec` |
+| `ensemble.request` | which message answers an asynchronous request, alone or in a collection | `request_spec` |
+| `ensemble.life` | a process's life: running, hibernated, on disk, exited | `life_spec` |
 | `ensemble.dist` | where a send goes, what a pid in a message is on arrival, what a lost connection does | `dist_spec` |
-| `ensemble.callback` | what a gen_server callback's return means | `callback_spec` |
-| `ensemble.statem` | gen_statem results, actions, postpone order, timeouts | `statem_spec` |
+| `ensemble.callback` | what a gen_server's init and callback returns mean, and their actions | `callback_spec` |
+| `ensemble.statem` | gen_statem init and results, actions, postpone order, timeouts | `statem_spec` |
 
-Every spec requires proof (`{:require :proved}`): 226 of their 236 laws
-are proved, 130 of them for every input -- among them that a selective
+Every spec requires proof (`{:require :proved}`): 312 of their 322 laws
+are proved, 201 of them for every input -- among them that a selective
 receive is the manual's, message by message and clause by clause, that a
 restart plan is the supervisor docs', that a child spec is refused for
 the reason `check_childspecs` gives, that a lost connection breaks exactly
@@ -308,8 +362,8 @@ the links and monitors across it, and that no gen_statem event is lost
 or duplicated, over mailboxes, children and queues of any length. The 10
 left to testing each say why: they recurse over patterns of any depth,
 over a callback's list of actions, or walk a message of any shape for the
-pids in it. `test/ensemble/order_proof.clj` holds
-the lemmas about clojure.core the supervisor's proofs cite.
+pids in it. `test/ensemble/order_proof.clj` and
+`timers_proof.clj` hold the lemmas about clojure.core the proofs cite.
 
 A law over `Any` covers values without NaN; one over `Any!` takes NaN in
 and compares with writ's `same`, where a NaN is the same as a NaN. Erlang

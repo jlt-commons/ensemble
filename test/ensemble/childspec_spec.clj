@@ -18,7 +18,18 @@
   its children are started from; ids are unique in any other.
 
   Each rejection names the fault as OTP's does: [:invalid-restart-type r],
-  :missing-id, [:duplicate-child-name id], and so on."
+  :missing-id, [:duplicate-child-name id], and so on.
+
+  A child's start returns the child, ignore, or {error, Error}.  On ignore
+  the supervisor keeps the spec with no process (pid undefined), unless the
+  child is :temporary; a :simple-one-for-one supervisor adds no child.
+  start_child then answers {ok, undefined}.
+
+  restart_child needs the spec and no running process: {error, not_found},
+  {error, running}, or {error, restarting} for a child being restarted.
+  delete_child the same.  terminate_child needs only the spec.  A
+  :simple-one-for-one supervisor refuses restart_child and delete_child.
+  which_children shows a child's pid, restarting, or undefined."
   (:require [writ.spec :refer [spec data ann refine graph law calls]]
             [ensemble.childspec :as cs]
             [ensemble.supervisor :as sup]))
@@ -33,7 +44,21 @@
 (refine Restart [r Keyword] (contains? #{:permanent :transient :temporary} r))
 (refine AutoShutdown [a Keyword] (contains? #{:never :any-significant :all-significant} a))
 
+;; what a child's start gave, and what the supervisor does with it
+(data Outcome (Started Any) (Ignored) (Failed Any))
+(data Kept (Add Any) (Skip) (Refuse Any))
+;; a child as a guard sees it
+(data Status (Running) (Restarting) (Stopped) (Absent))
+(data Op (Restart) (Delete) (Terminate))
+(data Go (Go) (No Any))
+
+(refine Strategy [s Keyword] (contains? #{:one-for-one :one-for-all :rest-for-one :simple-one-for-one} s))
+
 (ann check-child [Any AutoShutdown -> Checked])
+(ann after-start [Strategy Restart Outcome -> Kept])
+(ann start-reply [Outcome -> Any])
+(ann may [Op Bool Status -> Go])
+(ann shown [Status Any -> Any])
 (ann check-flags [Any -> Checked])
 (ann check-specs [(Map Keyword Any) (Vec Any) -> Checked])
 
@@ -182,7 +207,64 @@
                                   [(assoc (worker) :restart :transient :significant true)])))
        (= :Error (first (check-specs flags [(assoc (worker) :restart :transient :significant true)])))))
 
+;; --- a child's start ---------------------------------------------------------
+
+(law a-started-child-is-added-running
+  (forall [st Strategy, r Restart, a Any]
+    (= (after-start st r [:Started a]) [:Add a])))
+
+(law an-ignored-child-is-kept-without-a-process
+  (forall [st Strategy, r Restart]
+    (=> (and (not= :temporary r) (not= :simple-one-for-one st))
+        (= (after-start st r [:Ignored]) [:Add nil]))))
+
+(law an-ignored-temporary-child-is-not-kept
+  (forall [st Strategy] (= (after-start st :temporary [:Ignored]) [:Skip])))
+
+(law an-ignored-dynamic-child-is-not-added
+  (forall [r Restart] (= (after-start :simple-one-for-one r [:Ignored]) [:Skip])))
+
+(law a-failed-start-is-refused
+  (forall [st Strategy, r Restart, e Any]
+    (= (after-start st r [:Failed e]) [:Refuse e])))
+
+(law start-child-answers-ok-undefined-for-ignore
+  (forall [a Any, e Any]
+    (and (= (start-reply [:Started a]) [:ok a])
+         (= (start-reply [:Ignored]) [:ok nil])
+         (= (start-reply [:Failed e]) [:error e]))))
+
+;; --- what a child operation needs ---------------------------------------------
+
+(law an-absent-child-is-not-found
+  (forall [op Op] (= (may op false [:Absent]) [:No :not-found])))
+
+(law restart-and-delete-need-a-child-that-is-not-running
+  (forall [op Op]
+    (=> (not= [:Terminate] op)
+        (and (= (may op false [:Running]) [:No :running])
+             (= (may op false [:Restarting]) [:No :restarting])
+             (= (may op false [:Stopped]) [:Go])))))
+
+(law terminate-needs-only-the-spec
+  (forall [s Status]
+    (=> (not= [:Absent] s) (= (may [:Terminate] false s) [:Go]))))
+
+(law simple-one-for-one-refuses-restart-and-delete
+  (forall [s Status]
+    (and (= (may [:Restart] true s) [:No :simple-one-for-one])
+         (= (may [:Delete] true s) [:No :simple-one-for-one]))))
+
+(law which-children-shows-pid-restarting-or-undefined
+  (forall [a Any]
+    (and (= (shown [:Running] a) a)
+         (= (shown [:Restarting] a) :restarting)
+         (= (shown [:Stopped] a) nil))))
+
 ;; --- the supervisor checks what it is given -----------------------------
 
 (calls sup/start* {:through [cs/check-flags cs/check-specs]})
-(calls sup/handle-start-child {:through [cs/check-child]})
+(calls sup/handle-start-child {:through [cs/check-child cs/after-start cs/start-reply]})
+(calls sup/restart {:through [cs/after-start]})
+(calls sup/start-all {:through [cs/after-start]})
+(calls sup/child-call {:through [cs/may cs/shown]})

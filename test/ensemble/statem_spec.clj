@@ -3,6 +3,12 @@
   gen_statem, from its docs.  The gen-statem runtime makes every decision
   here.
 
+  init returns {ok, State, Data} or {ok, State, Data, Actions}: the
+  machine starts in State.  {stop, Reason}: start fails with Reason, and
+  the process exits with it.  {error, Reason} or ignore: start answers
+  {error, Reason} or ignore, and the process exits normal.  Anything else
+  is {bad_return_value, Ret}.
+
   A callback returns one of
 
       [:next-state s d]        [:next-state s d actions]
@@ -17,6 +23,8 @@
   Actions: :postpone, [:next-event type content], [:reply from value],
   [:timeout ms content] (the event timeout), [:state-timeout ms content],
   [:generic-timeout name ms content].  A time of nil or :infinity cancels.
+  :hibernate or [:hibernate bool]: hibernate before waiting for the next
+  event; of several, the last decides.
 
   The event queue:
   - A postponed event is kept; while the state stays the same it is not
@@ -41,14 +49,21 @@
   (Stop Any (Vec Any) Any)
   (Bad Any))
 
+(data Init
+  (Start Any Any (Vec Any))
+  (Ignore)
+  (Fail Any Any))
+
 (data Actions (Actions Bool (Vec Any) (Vec Any) (Vec Any)))
 
 (data Queues (Queues (Vec Any) (Vec Any)))
 
 (refine Kind [k Keyword] (contains? #{:event :enter} k))
 
+(ann init-of [Any -> Init])
 (ann result-of [Kind Any Any Any -> Result])
 (ann actions-of [(Vec Any) -> Actions])
+(ann hibernate? [(Vec Any) -> Bool])
 (ann next-queues [Bool Bool Any (Vec Any) (Vec Any) (Vec Any) -> Queues])
 (ann next-timers [Bool (Map Any Any) (Vec Any) -> (Map Any Any)])
 
@@ -121,6 +136,22 @@
 ;; --- actions ------------------------------------------------------------
 
 (law no-actions (= (actions-of []) [:Actions false [] [] []]))
+
+(law hibernate-is-an-action-of-its-own
+  (and (= (actions-of [:hibernate]) [:Actions false [] [] []])
+       (= (actions-of [[:hibernate true]]) [:Actions false [] [] []])))
+
+(law no-hibernate-action-does-not-hibernate
+  (forall [ms Nat, c Any] (not (hibernate? [[:timeout ms c] :postpone]))))
+
+(law a-hibernate-action-hibernates
+  (forall [ms Nat, c Any]
+    (and (hibernate? [:hibernate])
+         (hibernate? [[:timeout ms c] [:hibernate true]]))))
+
+(law the-last-hibernate-action-decides
+  (and (not (hibernate? [:hibernate [:hibernate false]]))
+       (hibernate? [[:hibernate false] :hibernate])))
 
 (law actions-split-in-order
   (= (actions-of [[:next-event :internal 1] [:reply from :r] :postpone
@@ -198,8 +229,45 @@
 (law the-last-action-for-a-timer-wins
   (= (next-timers false {} [[:state 1 :a] [:state 2 :b]]) {:state [2 :b]}))
 
+;; --- init --------------------------------------------------------------------
+
+(refine Starts  [i Init] (= :Start (first i)))
+(refine Ignores [i Init] (= :Ignore (first i)))
+(refine Fails   [i Init] (= :Fail (first i)))
+
+(graph init
+  {:states {:ret Any, :start Starts, :ignore Ignores, :fail Fails}
+   :edges  {:ret {[init-of _] #{:start :ignore :fail}}}})
+
+(law init-ok-starts-in-the-state
+  (forall [st Any, d Any] (= (init-of [:ok st d]) [:Start st d []])))
+
+(law init-ok-with-actions
+  (forall [st Any, d Any, as (Vec Any)] (= (init-of [:ok st d as]) [:Start st d as])))
+
+(law init-ignore
+  (= (init-of :ignore) [:Ignore]))
+
+(law init-error-exits-normal
+  (forall [why Any] (= (init-of [:error why]) [:Fail why :normal])))
+
+(law init-stop-exits-with-its-reason
+  (forall [why Any] (= (init-of [:stop why]) [:Fail why why])))
+
+(law a-bare-state-and-data-is-a-bad-init
+  (forall [st Any, d Any]
+    (=> (not (contains? #{:ok :stop :error} st))
+        (= (init-of [st d]) [:Fail [:bad-return-value [st d]] [:bad-return-value [st d]]]))))
+
+(law init-actions-must-be-a-list
+  (forall [st Any, d Any, k Keyword]
+    (= (init-of [:ok st d k]) [:Fail [:bad-return-value [:ok st d k]] [:bad-return-value [:ok st d k]]])))
+
 ;; --- the runtime decides through these ----------------------------------
 
+(calls ensemble.gen-statem/run {:through [ensemble.statem/init-of]})
+
+
 (calls ensemble.gen-statem/transition!
-  {:through [ensemble.statem/result-of ensemble.statem/actions-of
+  {:through [ensemble.statem/result-of ensemble.statem/actions-of ensemble.statem/hibernate?
              ensemble.statem/next-queues ensemble.statem/next-timers]})
