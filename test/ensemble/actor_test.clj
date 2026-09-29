@@ -294,3 +294,16 @@
     (act/! a [:bump 5])
     (is (= 15 (act/join a 1000)))
     (is (= 15 (act/state a)))))
+
+(deftest an-actor-killed-before-its-first-step-still-dies
+  ;; an exit signal can reach a new actor's fiber before it has run a step;
+  ;; the actor must still die of it, and its monitors and links hear so
+  (let [out (promise)]
+    (act/spawn (fn []
+                 (deliver out
+                          (vec (for [_ (range 300)]
+                                 (let [a (act/spawn-link (fn [] (receive [_ nil])))]
+                                   (act/unlink! a)
+                                   (act/exit! a :shutdown)
+                                   (act/exit-reason a 1000)))))))
+    (is (every? #{:shutdown} (deref out 60000 [:timeout])))))

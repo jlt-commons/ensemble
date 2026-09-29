@@ -501,13 +501,18 @@
       (::fiber me)
       (fib/spawn
        (fn []
-         @go
-         (binding [*actor* me]
-           ;; the body runs interruptible; what follows it -- telling the
-           ;; links and monitors -- must not be torn by a late kill, so it
-           ;; runs masked, and a kill arriving then is simply too late
-           (fib/masked
-            (fn []
+         ;; masked from the first step: a kill that arrives before the body
+         ;; starts -- while this fiber waits for go -- stays pending until the
+         ;; body's try is in place, and lands there.  Raised at the wait
+         ;; instead, it escaped the try, the actor was never settled, and it
+         ;; lived on with no DOWN or link signal ever sent
+         (fib/masked
+          (fn []
+            @go
+            (binding [*actor* me]
+              ;; the body runs interruptible; what follows it -- telling the
+              ;; links and monitors -- must not be torn by a late kill, so it
+              ;; runs masked, and a kill arriving then is simply too late
               (let [r (try
                         (fib/unmasked (fn [] (drain-signals! me) {:ok (f)}))
                         (catch Throwable e {:err e}))
@@ -520,6 +525,15 @@
                          (if (sig/normal? reason)
                            [:ok (:ok r)]
                            [:err (or (:err r) (exit-ex reason)) reason])))))))))
+     ;; a kill that reaches the fiber before it runs its first step kills it
+     ;; there, before any of the above: settle the actor from the fiber's
+     ;; end instead, so its links and monitors still hear of it
+     (fib/monitor! @(::fiber me)
+                   (fn [err]
+                     (when (and err (not (realized? (::done me))))
+                       (let [reason (or (dying-of me) (reason-of err))]
+                         (settle! me reason)
+                         (deliver (::done me) [:err err reason])))))
      (deliver go true)
      me)))
 

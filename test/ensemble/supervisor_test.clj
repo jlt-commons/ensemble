@@ -23,15 +23,17 @@
   ([log id trap?]
    (fn []
      (swap! log conj [:start id])
+     ;; trapping from the start: a supervisor may stop the child before its
+     ;; body has run a step
      (act/spawn-link
       (fn []
-        (when trap? (act/trap-exit!))
         (loop []
           (receive
            [:die (act/exit! :boom)]
            [:quit :ok]
            [[:EXIT _ r] (do (swap! log conj [:stop id r]) (act/exit! r))]
-           [_ (recur)])))))))
+           [_ (recur)])))
+      {:trap trap?}))))
 
 (defn- starts [log id] (count (filter #(= [:start id] %) @log)))
 
