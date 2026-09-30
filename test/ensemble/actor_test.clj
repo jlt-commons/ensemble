@@ -216,8 +216,10 @@
 (deftest demonitor-flush-removes-a-delivered-down
   (let [target (act/spawn (fn [] :done))
         watcher (act/spawn (fn []
+                             ;; wait for the target to be gone: a first DOWN
+                             ;; still to come would not be flushed below
                              (let [ref (act/monitor! target)]
-                               (receive [[:DOWN ref _ _ _] nil] [:after 0 nil])
+                               (receive [[:DOWN ref _ _ _] nil] [:after 1000 nil])
                                (let [ref2 (act/monitor! target)]
                                  (sleep 20)
                                  (act/demonitor! ref2 {:flush true})

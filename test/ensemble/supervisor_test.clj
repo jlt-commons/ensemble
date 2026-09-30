@@ -177,8 +177,8 @@
 (deftest a-child-that-ignores-shutdown-is-killed-after-its-timeout
   (let [s (sup/start {} [{:id :stubborn :shutdown 50
                           :start (fn [] (act/spawn-link
-                                         (fn [] (act/trap-exit!)
-                                           (loop [] (receive [_ (recur)])))))}])
+                                         (fn [] (loop [] (receive [_ (recur)])))
+                                         {:trap true}))}])
         c (sup/child s :stubborn)]
     (sup/terminate-child! s :stubborn)
     (is (= :killed (act/exit-reason c 1000)))

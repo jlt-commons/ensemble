@@ -74,8 +74,7 @@
     (is (= :boom (act/exit-reason b 1000)))))
 
 (deftest exit-kill-cannot-be-trapped
-  (let [b (act/spawn (fn [] (act/trap-exit!) (receive [_ :trapped])))]
-    (sleep 10)
+  (let [b (act/spawn (fn [] (receive [_ :trapped])) {:trap true})]
     (act/exit! b :kill)
     (is (= :killed (act/exit-reason b 1000)))))
 
@@ -110,7 +109,8 @@
     (is (= :alive (act/join b 1000)))))
 
 (deftest exit-2-reaches-a-trapper-as-a-message-from-the-sender
-  (let [b (act/spawn (fn [] (act/trap-exit!) (receive [[:EXIT from r] [from r]])))
+  ;; trapping from spawn: s may signal before b's body has run a step
+  (let [b (act/spawn (fn [] (receive [[:EXIT from r] [from r]])) {:trap true})
         s (act/spawn (fn [] (act/exit! b :bye) :sent))]
     (is (= :sent (act/join s 1000)))
     (is (= [s :bye] (act/join b 1000)))))
@@ -177,10 +177,10 @@
 (deftest a-trapping-busy-actor-is-not-interrupted
   (let [done (atom false)
         a (act/spawn (fn []
-                       (act/trap-exit!)
                        (dotimes [_ 2000000] nil)
                        (reset! done true)
-                       (receive [[:EXIT _ r] r])))]
+                       (receive [[:EXIT _ r] r]))
+                     {:trap true})]
     (sleep 5)
     (act/exit! a :boom)
     (is (= :boom (act/join a 5000)))
