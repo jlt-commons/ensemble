@@ -17,7 +17,7 @@ Not published yet, so point at the git repo:
 ```
 
 It needs a jolt with fiber interrupts (`jolt.fibers/interrupt!`, merged in
-jolt-lang/jolt#1165); until a release has them, run a checkout of jolt main.
+jolt-lang/jolt#1165): 0.8.15 or later.
 
 ## Processes
 

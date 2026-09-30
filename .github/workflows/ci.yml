@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      jolt-version:
+        description: "jolt version to install (blank = the pinned JOLT_VERSION below)"
+        required: false
+        default: ""
+
+# pinned, as across jlt-commons: a floating latest lets a new jolt release
+# turn CI red on a tree nobody touched.  The dispatch input overrides it for
+# one run, to try a candidate release
+env:
+  JOLT_VERSION: ${{ inputs.jolt-version || 'v0.8.15' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # a clean run takes about five minutes, most of it writ's proofs; the
+    # actor tests can hang on a regression, and this turns that into a failure
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install jolt
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6
+          curl --fail --retry 5 --retry-delay 5 --retry-all-errors -sL \
+            https://raw.githubusercontent.com/jolt-lang/jolt/main/install \
+            | bash -s -- --version "$JOLT_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Version
+        run: jolt --version
+      # proofs found before; writ reuses one only when writ, the spec and the
+      # code are all unchanged, so an older cache is safe to start from
+      - uses: actions/cache@v4
+        with:
+          path: .writ-cache
+          key: writ-cache-${{ hashFiles('deps.edn', 'src/**', 'test/**') }}
+          restore-keys: writ-cache-
+      - name: Tests
+        run: jolt -M:test
