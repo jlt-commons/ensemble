@@ -65,7 +65,9 @@
 
 (graph init
   {:states {:ret Any, :start Starts, :ignore Ignores, :fail Fails}
-   :edges  {:ret {[interpret-init _] #{:start :ignore :fail}}}})
+   :edges  {:ret {[interpret-init _] #{:start :ignore :fail}}}
+   ;; a generated return is seldom :ignore or an [:ok state]
+   :witnesses {[:ret :start] [[:ok 1]], [:ret :ignore] [:ignore]}})
 
 ;; --- timeouts -----------------------------------------------------------
 

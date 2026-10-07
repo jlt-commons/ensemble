@@ -237,7 +237,9 @@
 
 (graph init
   {:states {:ret Any, :start Starts, :ignore Ignores, :fail Fails}
-   :edges  {:ret {[init-of _] #{:start :ignore :fail}}}})
+   :edges  {:ret {[init-of _] #{:start :ignore :fail}}}
+   ;; a generated return is seldom :ignore or an [:ok state data]
+   :witnesses {[:ret :start] [[:ok 1 2]], [:ret :ignore] [:ignore]}})
 
 (law init-ok-starts-in-the-state
   (forall [st Any, d Any] (= (init-of [:ok st d]) [:Start st d []])))
