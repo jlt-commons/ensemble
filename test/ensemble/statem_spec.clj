@@ -235,8 +235,22 @@
 (refine Ignores [i Init] (= :Ignore (first i)))
 (refine Fails   [i Init] (= :Fail (first i)))
 
+(defn init-shaped
+  "x, or one of the returns init gives that a random value seldom is:
+  {ok, State, Data} with or without actions, or ignore."
+  [x]
+  (case (mod (hash x) 4)
+    0 [:ok x x]
+    1 [:ok x x []]
+    2 :ignore
+    x))
+
+;; any value can come back from init; most that a draw makes are bad ones,
+;; so it is built to be a good one as often
+(refine InitReturn [r Any] (any? r) {:build init-shaped})
+
 (graph init
-  {:states {:ret Any, :start Starts, :ignore Ignores, :fail Fails}
+  {:states {:ret InitReturn, :start Starts, :ignore Ignores, :fail Fails}
    :edges  {:ret {[init-of _] #{:start :ignore :fail}}}})
 
 (law init-ok-starts-in-the-state
