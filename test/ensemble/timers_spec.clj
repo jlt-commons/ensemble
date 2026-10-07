@@ -21,13 +21,14 @@
   A timer is [:Timer ref deadline dest msg every owner]: every is nil for a
   one-shot timer, owner is the process an interval is linked to (nil for
   none).  Deadlines are milliseconds of a monotonic clock."
-  (:require [writ.spec :refer [spec data ann refine graph law calls]]
+  (:require [writ.spec :refer [spec data ann refine graph law calls same]]
             [ensemble.timers :as tm]
             [ensemble.timer :as timer]))
 
 (spec ensemble.timers {:require :proved})
 
-(data Timer (Timer Any Int Any Any Any Any))
+(refine Every [e Any] (or (nil? e) (nat-int? e)))
+(data Timer (Timer Any Int Any Any Every Any))
 (data Cancelled (Cancelled (Vec Timer) Any))
 (data Due (Due (Vec Any) (Vec Timer)))
 
@@ -129,6 +130,10 @@
     (= (fired (due (arm (arm [] :first now a d m nil nil) :second now a e n nil nil) (+ now a)))
        [[d m] [e n]])))
 
+(law due-leaves-the-table-fire-does
+  (forall [t (Vec Timer), now Int]
+    (same (nth (due t now) 2) (fire t now))))
+
 (law only-the-expired-fire
   (forall [now Int, a Nat, b Nat, d Keyword, m Any, n Any]
     (=> (< a b)
@@ -140,6 +145,12 @@
     (=> (pos? ms)
         (= (due (arm [] r now ms d m ms o) (+ now ms))
            [:Due [[d m]] [[:Timer r (+ now ms ms) d m ms o]]]))))
+
+(law equal-deadline-intervals-come-back-in-start-order
+  (forall [now Int, ms Nat, d Keyword, m Any, n Any, o Keyword]
+    (=> (pos? ms)
+        (= (fire (arm (arm [] :first now ms d m ms o) :second now ms d n ms o) (+ now ms))
+           [[:Timer :first (+ now ms ms) d m ms o] [:Timer :second (+ now ms ms) d n ms o]]))))
 
 ;; --- exits --------------------------------------------------------------
 
