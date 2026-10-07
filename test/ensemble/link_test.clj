@@ -185,3 +185,20 @@
     (act/exit! a :boom)
     (is (= :boom (act/join a 5000)))
     (is @done)))
+
+(deftest an-exit-signal-stays-ahead-of-a-later-message
+  ;; signals from one actor to another arrive in the order they were sent, as
+  ;; in Erlang: the [:EXIT] of an exit! comes before a message sent after it,
+  ;; even when the receiver was not in a receive as both arrived
+  (let [go (promise)
+        r (act/spawn (fn []
+                       (act/trap-exit!)
+                       @go
+                       [(receive [m m]) (receive [m m])]))
+        s (act/spawn (fn []
+                       (act/exit! r :hello)
+                       (act/! r :ping)
+                       (deliver go true)
+                       (receive [:never nil])))]
+    (is (= [[:EXIT s :hello] :ping] (act/join r 1000)))
+    (act/exit! s :kill)))
