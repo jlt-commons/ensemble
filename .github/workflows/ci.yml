@@ -14,7 +14,7 @@ on:
 # turn CI red on a tree nobody touched.  The dispatch input overrides it for
 # one run, to try a candidate release
 env:
-  JOLT_VERSION: ${{ inputs.jolt-version || 'v0.8.15' }}
+  JOLT_VERSION: ${{ inputs.jolt-version || 'v0.8.18' }}
 
 jobs:
   test:
