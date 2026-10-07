@@ -14,13 +14,15 @@
   a time, leaving each one no clause wants at the end of the first part.  So
   taking the oldest message costs the same however many wait behind it.
 
-  Exit signals travel apart from messages, in the signal queue, and what each
-  one does is decided by ensemble.signal/on-signal: die, turn it into an
-  [:EXIT from reason] message (when trapping exits), or ignore it.  A signal
-  the target must die of also interrupts its fiber (jolt.fibers/interrupt!),
-  so it dies wherever it is -- in a receive, in a long computation, parked on
-  a channel of its own -- as an Erlang process does.  The rest wait in the
-  queue, which is drained whenever the actor enters or wakes in a receive.
+  Exit signals join the queue with the messages, in the order they arrive,
+  and what each one does is decided by ensemble.signal/on-signal: die, turn
+  it into an [:EXIT from reason] message (when trapping exits), or ignore
+  it.  An [:EXIT] takes its signal's place, so it comes before the messages
+  sent after it, as in Erlang.  A signal the target must die of also
+  interrupts its fiber (jolt.fibers/interrupt!), so it dies wherever it is
+  -- in a receive, in a long computation, parked on a channel of its own --
+  as an Erlang process does.  The rest wait in the queue, and are acted on
+  whenever the actor enters or wakes in a receive.
   A kill cannot be caught for good: an actor whose body swallows it dies of
   it at its next receive, or as its body returns.
 
@@ -200,6 +202,10 @@
   (a/offer! (::bell actor) true)
   (wake! actor event))
 
+(deftype ^:private Signal [s])
+
+(defn- signal? [m] (instance? Signal m))
+
 (defn- enqueue!
   "Append msg to the actor's mailbox.  A message to a dead actor is dropped."
   [actor msg]
@@ -256,7 +262,10 @@
   is acted on by the sender, at once, so it is left to the queue."
   [actor s]
   (when (alive? actor)
-    (swap! (::signals actor) conj s)
+    ;; counted before it is queued, so a drain never finds more than the
+    ;; count says
+    (swap! (::signals actor) inc)
+    (swap! (::inbox actor) conj (Signal. s))
     (ring! actor [:Signal])
     (when (and (not= (:from s) actor)
                (or (not= :link (:kind s)) (not (:checked s)) (linked-to? actor (:from s))))
@@ -265,9 +274,10 @@
           (kill! actor (second act)))))))
 
 (defn- handle-signal!
-  "Act on one exit signal.  A link signal from an actor no longer linked (it
-  was unlinked while the signal was in flight) is dropped, as in Erlang, and
-  one that is acted on removes the link."
+  "Act on one exit signal: the [:EXIT] message it becomes, or nil.  A link
+  signal from an actor no longer linked (it was unlinked while the signal
+  was in flight) is dropped, as in Erlang, and one that is acted on removes
+  the link."
   [actor {:keys [kind from reason checked]}]
   (when (or (not= :link kind) (not checked) (linked-to? actor from))
     (when (= :link kind)
@@ -275,17 +285,26 @@
     (let [act (sig/on-signal @(::trapping actor) kind reason (= from actor))]
       (case (first act)
         :Die     (throw (exit-ex (second act)))
-        :Deliver (enqueue! actor [:EXIT from (second act)])
+        :Deliver [:EXIT from (second act)]
         :Ignore  nil))))
 
 (defn- drain-signals!
-  "Act on every queued exit signal, oldest first.  An actor already killed
-  dies here, even if its body caught the kill."
+  "Act on every queued exit signal, oldest first, each in its place in the
+  queue: an [:EXIT] it becomes stays ahead of the messages sent after it.
+  An actor already killed dies here, even if its body caught the kill."
   [actor]
   (when-let [reason (dying-of actor)]
     (throw (exit-ex reason)))
-  (let [[ss _] (swap-vals! (::signals actor) (constantly []))]
-    (doseq [s ss] (handle-signal! actor s))))
+  (when (pos? @(::signals actor))
+    (let [inbox (::inbox actor)
+          ss (filterv signal? @inbox)
+          ;; each signal's message, by the signal itself: senders only add
+          ;; to the queue's end, so the signals seen here stay where they are
+          msgs (reduce (fn [m sg] (assoc m sg (handle-signal! actor (.-s ^Signal sg)))) {} ss)]
+      (swap! (::signals actor) - (count ss))
+      (swap! inbox (fn [q] (into empty-queue
+                                 (keep (fn [m] (if (contains? msgs m) (get msgs m) m)))
+                                 q))))))
 
 (defn exit!
   "(exit! reason) exits the current actor with reason, as Erlang's exit/1: it
@@ -382,7 +401,7 @@
   "Remove every mailbox message pred accepts."
   [actor pred]
   (swap! (::saved actor) (fn [ms] (into [] (remove pred) ms)))
-  (swap! (::inbox actor) (fn [q] (into empty-queue (remove pred) q))))
+  (swap! (::inbox actor) (fn [q] (into empty-queue (remove #(and (not (signal? %)) (pred %))) q))))
 
 (defn demonitor!
   "Stop the monitor ref.  No DOWN message is sent after this returns; with
@@ -562,7 +581,7 @@
 (defn- pending?
   "Is there something for me to wake to: a message, a signal, a kill?"
   [me]
-  (boolean (or (seq @(::inbox me)) (seq @(::saved me)) (seq @(::signals me)) (dying-of me))))
+  (boolean (or (seq @(::inbox me)) (seq @(::saved me)) (dying-of me))))
 
 (defn- wake!
   "A message or a signal reached me: if it was hibernating, it runs again,
@@ -651,7 +670,8 @@
      ::node node
      ::saved (atom [])
      ::inbox (atom empty-queue)
-     ::signals (atom [])
+     ;; how many exit signals wait in ::inbox
+     ::signals (atom 0)
      ::bell (a/chan (a/dropping-buffer 1))
      ::done (promise)
      ::links (atom #{})
@@ -740,20 +760,23 @@
 (defn- take-new!
   "Take messages off me's queue, oldest first, until one satisfies a clause:
   [clause-index msg env] for it, or nil once the queue is empty.  Each one
-  none wants joins the saved messages, in order.  Only the actor pops its
-  queue, so the head it peeks is the head it pops."
+  none wants joins the saved messages, in order.  An exit signal at the head
+  stops it with ::signal, to be acted on before what follows it.  Only the
+  actor pops its queue, so the head it peeks is the head it pops."
   [me pats ok?]
   (let [inbox (::inbox me)]
     (loop []
       (let [q @inbox]
         (when-not (empty? q)
           (let [m (peek q)]
-            (swap! inbox pop)
-            (let [r (select/clause-of pats ok? m)]
-              (if (= :Hit (first r))
-                (let [[_ k env] r] [k m env])
-                (do (swap! (::saved me) conj m)
-                    (recur))))))))))
+            (if (signal? m)
+              ::signal
+              (do (swap! inbox pop)
+                  (let [r (select/clause-of pats ok? m)]
+                    (if (= :Hit (first r))
+                      (let [[_ k env] r] [k m env])
+                      (do (swap! (::saved me) conj m)
+                          (recur))))))))))))
 
 (defn receive-match
   "Block until a message matches one of the compiled patterns pats whose guard
@@ -773,14 +796,19 @@
              ;; an emptied subvec is let go, not kept to grow on
              (reset! (::saved me) (let [s (select/without saved i)] (if (empty? s) [] s)))
              [k (nth saved i) env])
-           (or (take-new! me pats ok?)
+           (let [r (take-new! me pats ok?)]
+             (cond
+               ;; a signal reached the head: act on it, then look on
+               (= ::signal r) (recur (count @(::saved me)))
+               r r
+               :else
                (let [scanned (count @(::saved me))]
                  (if deadline
                    (let [left (- deadline (System/currentTimeMillis))]
                      (if (pos? left)
                        (do (a/alts!! [(::bell me) (a/timeout left)]) (recur scanned))
                        [:timeout]))
-                   (do (a/<!! (::bell me)) (recur scanned)))))))))))
+                   (do (a/<!! (::bell me)) (recur scanned))))))))))))
 
 (defn- guard-fn
   "The ok? fn for a receive's clauses: each guard evaluated with its clause's
