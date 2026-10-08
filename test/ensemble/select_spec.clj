@@ -14,7 +14,7 @@
 
 (spec ensemble.select {:require :proved :test {:trials 500}})
 
-(data Pattern Wild Nil (Lit Any) (Bind Symbol) (Cons Pattern Pattern))
+(data Pattern Wild Nil (Lit Any) (Bind Symbol) (Cons Pattern Pattern) IsMap (Has Any Pattern Pattern))
 (data Hit (Hit Nat (Map Symbol Any)) (Miss))
 (data Scan (Take Nat Nat (Map Symbol Any)) (None Nat))
 

@@ -237,13 +237,19 @@
     (swap! (::inbox actor) conj msg)
     (ring! actor [:Mail])))
 
+(declare send-alias!)
+
+(defn- alias-ref? [x] (and (map? x) (contains? x ::owner)))
+
 (defn !
   "Send msg to dest, a process (on this node or another), a registered
-  name, or [:At name node].  Never blocks.  Returns msg.  A message to a
-  dead process is silently dropped; a message to a name nobody holds
-  throws."
+  name, [:At name node], or an alias (see alias!).  Never blocks.  Returns
+  msg.  A message to a dead process, or to an alias no longer active, is
+  silently dropped; a message to a name nobody holds throws."
   [dest msg]
-  (proc/-deliver (resolve-dest dest) msg)
+  (if (alias-ref? dest)
+    (send-alias! dest msg)
+    (proc/-deliver (resolve-dest dest) msg))
   msg)
 
 ;; exit signals ---------------------------------------------------------
@@ -432,7 +438,8 @@
   (let [me (self)
         obj (when-not (pid? dest) (name-object dest))
         actor (if obj (try (resolve-dest dest) (catch Throwable _ nil)) dest)
-        ref (make-ref)
+        ;; the watcher's pid, for the target's process-info :monitored-by
+        ref (assoc (make-ref) ::by (::pid me))
         watching (::monitoring me)
         who (or obj actor)]
     (if (nil? actor)
@@ -746,6 +753,7 @@
      ::resume (atom nil)
      ::refused (atom nil)
      ::fiber (atom nil)
+     ::waiting (atom false)
      ::trapping (atom false)}
     {:type ::actor}))
 
@@ -812,6 +820,55 @@
   [f & args]
   (apply swap! (::state (self)) f args))
 
+;; introspection --------------------------------------------------------
+
+(defn- status-of [actor]
+  (case @(::lifecycle actor)
+    [:Hibernated] :hibernating
+    [:Passivated] :passivated
+    (if @(::waiting actor) :waiting :running)))
+
+(def ^:private info-keys
+  [:registered-name :status :message-queue-len :messages :links :monitors
+   :monitored-by :trap-exit])
+
+(defn- info-item [actor k]
+  (case k
+    :registered-name (registered-name actor)
+    :status (status-of actor)
+    :messages (into @(::saved actor) (remove signal?) @(::inbox actor))
+    :message-queue-len (+ (count @(::saved actor)) (count (remove signal? @(::inbox actor))))
+    :links (let [ls @(::links actor)] (if (open? ls) ls #{}))
+    :monitors (vec (for [[_ t] @(::monitoring actor) :when (watched? t)] [:process t]))
+    :monitored-by (let [ms @(::monitors actor)]
+                    (if (open? ms)
+                      (vec (keep (fn [r] (when-let [w (get @procs (::by r))]
+                                           (when (= (::node w) (::node r)) w)))
+                                 (keys ms)))
+                      []))
+    :trap-exit @(::trapping actor)
+    (throw (ex-info "not a process-info item" {:reason :badarg :item k}))))
+
+(defn process-info
+  "What is known of a live local actor, as Erlang's process_info: a map of
+  :registered-name, :status (:running, :waiting in a receive, :hibernating
+  or :passivated), :message-queue-len, :messages, :links, :monitors (each
+  [:process p]), :monitored-by (the local actors monitoring it) and
+  :trap-exit; with k, that item alone.  nil once the actor has exited.  A
+  process on another node is a badarg, as in Erlang."
+  ([actor] (process-info actor nil))
+  ([actor k]
+   (let [actor (resolve-dest actor)]
+     (when-not (actor? actor)
+       (throw (ex-info "process-info takes a local process" {:reason :badarg :process actor})))
+     (when (alive? actor)
+       (if k (info-item actor k) (into {} (map (fn [k] [k (info-item actor k)])) info-keys))))))
+
+(defn processes
+  "The live actors of this node, as Erlang's processes/0."
+  []
+  (filterv #(and (= (node) (::node %)) (alive? %)) (vals @procs)))
+
 ;; receive --------------------------------------------------------------
 
 (defn always
@@ -839,6 +896,12 @@
                       (let [[_ k env] r] [k m env])
                       (do (swap! (::saved me) conj m)
                           (recur))))))))))))
+
+(defn- waiting!
+  "Park me in (wait), marked as waiting for a message the while."
+  [me wait]
+  (reset! (::waiting me) true)
+  (try (wait) (finally (reset! (::waiting me) false))))
 
 (defn receive-match
   "Block until a message matches one of the compiled patterns pats whose guard
@@ -869,9 +932,9 @@
                  (if deadline
                    (let [left (- deadline (now-ms))]
                      (if (pos? left)
-                       (do (a/alts!! [(::bell me) (a/timeout left)]) (recur scanned))
+                       (do (waiting! me #(a/alts!! [(::bell me) (a/timeout left)])) (recur scanned))
                        [:timeout]))
-                   (do (a/<!! (::bell me)) (recur scanned))))))))))))
+                   (do (waiting! me #(a/<!! (::bell me))) (recur scanned))))))))))))
 
 (defn- guard-fn
   "The ok? fn for a receive's clauses: each guard evaluated with its clause's
@@ -898,14 +961,19 @@
   (cond
     (and (vector? p) (= :Pin (first p))) `[:Lit ~(second p)]
     (and (vector? p) (= :Cons (first p))) `[:Cons ~(pinned-pattern (nth p 1)) ~(pinned-pattern (nth p 2))]
+    ;; a symbol key is a bound name (pattern-error refuses any other)
+    (and (vector? p) (= :Has (first p)))
+    (let [k (nth p 1)]
+      `[:Has ~(if (symbol? k) k `(quote ~k)) ~(pinned-pattern (nth p 2)) ~(pinned-pattern (nth p 3))])
     :else `(quote ~p)))
 
 (defmacro receive
   "Selective receive over the current actor's mailbox.
 
   Each clause is [pattern & body], or [pattern :when guard & body].  A pattern
-  is a tuple [:tag x ...], a symbol (binds the message), _ (wildcard) or a
-  literal.  A symbol already bound where the receive is written matches its
+  is a tuple [:tag x ...], a tuple with a tail [h & t], a map {:k p ...}
+  (holding at least those keys), a symbol (binds the message), _ (wildcard)
+  or a literal; see ensemble.pattern.  A symbol already bound where the receive is written matches its
   value instead of binding (Erlang's rule), and a name repeated in a pattern
   must match equal values.  The guard sees the clause's bindings; a message
   whose guard is false or throws is left for another clause.  Two special
@@ -924,6 +992,8 @@
                            (= pat :after) {:kind :after :timeout (first more) :body (rest more)}
                            :else
                            (let [pat (if (= pat :else) '_ pat)
+                                 _ (when-let [e (pattern/pattern-error pat pinned)]
+                                     (throw (ex-info e {:pattern pat})))
                                  [guard body] (if (= :when (first more))
                                                 [(second more) (drop 2 more)]
                                                 [nil more])]

@@ -10,7 +10,9 @@
   Nil
   (Lit Any)
   (Bind Symbol)
-  (Cons Pattern Pattern))
+  (Cons Pattern Pattern)
+  IsMap
+  (Has Any Pattern Pattern))
 
 (ann capture [Pattern Any -> Any])
 
@@ -20,19 +22,22 @@
 (refine BindP  [p Pattern] (= :Bind (first p)))
 (refine LitP   [p Pattern] (= :Lit (first p)))
 (refine TupleP [p Pattern] (contains? #{:Nil :Cons} (first p)))
+(refine MapP   [p Pattern] (contains? #{:IsMap :Has} (first p)))
 (refine Matched [b Any] (map? b))
 (refine Outcome [b Any] (or (nil? b) (map? b)))
 
 ;; a wildcard or a binder takes any message; a literal or a tuple may also
 ;; refuse it, with nil -- which ones match is pinned by the laws below
 (graph capture
-  {:states {:wild WildP, :bind BindP, :lit LitP, :tuple TupleP,
+  {:states {:wild WildP, :bind BindP, :lit LitP, :tuple TupleP, :map MapP,
             :matched Matched, :outcome Outcome}
    :edges  {:wild  {[capture Any] #{:matched}}
             :bind  {[capture Any] #{:matched}}
             :lit   {[capture Any] #{:outcome}}
-            :tuple {[capture Any] #{:outcome}}}
-   :tested {:tuple "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"}})
+            :tuple {[capture Any] #{:outcome}}
+            :map   {[capture Any] #{:outcome}}}
+   :tested {:tuple "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"
+            :map "capture recurses over a Pattern of any depth, a recursive data type the prover does not unfold"}})
 
 (def two-tuple [:Cons [:Wild] [:Nil]])
 (def bind-pair [:Cons [:Bind 'l] [:Cons [:Bind 'r] [:Nil]]])
@@ -107,3 +112,64 @@
 
 (law a-nan-in-a-tuple-matches-a-nan-there
   (= {} (capture [:Cons [:Lit 1] [:Cons [:Lit ##NaN] [:Nil]]] [1 ##NaN])))
+
+;; --- list tails ------------------------------------------------------------
+;; [x & r] compiles to a Cons whose tail is a pattern itself, not Nil: the
+;; tail matches whatever is left of the message, as Erlang's [H|T]
+
+(def head-tail [:Cons [:Bind 'h] [:Bind 't]])
+
+(law a-tail-takes-the-rest
+  (forall [a Any, b Any, c Any]
+    (= (capture head-tail [a b c]) {'h a 't [b c]})))
+
+(law a-tail-may-be-empty
+  (forall [a Any] (= (capture head-tail [a]) {'h a 't []})))
+
+(law a-tail-needs-a-head
+  (and (nil? (capture head-tail [])) (nil? (capture head-tail 7))))
+
+(law a-tail-can-be-a-tuple
+  (forall [a Any, b Any]
+    (and (= {} (capture [:Cons [:Lit a] [:Nil]] [a]))
+         (= {'h a} (capture [:Cons [:Bind 'h] [:Cons [:Lit b] [:Nil]]] [a b])))))
+
+;; --- maps ----------------------------------------------------------------
+;; {:k p} compiles to [:Has :k p [:IsMap]]: the message must be a map
+;; holding every key named, each value matching its pattern.  Keys not named
+;; are allowed, as in Erlang's #{k := V}.
+
+(law ismap-matches-any-map
+  (forall [m (Map Keyword Int)] (= {} (capture [:IsMap] m))))
+
+(law ismap-rejects-a-non-map
+  (and (nil? (capture [:IsMap] [1 2])) (nil? (capture [:IsMap] nil)) (nil? (capture [:IsMap] 3))))
+
+(def has-k [:Has :k [:Bind 'v] [:IsMap]])
+
+(law has-binds-the-value
+  (forall [n Int, x Int] (= {'v n} (capture has-k {:k n :other x}))))
+
+(law has-needs-the-key
+  (forall [n Int] (nil? (capture has-k {:j n}))))
+
+(law has-takes-a-nil-value-that-is-there
+  (= {'v nil} (capture has-k {:k nil})))
+
+(law has-value-must-match
+  (forall [n Int]
+    (and (= {} (capture [:Has :k [:Lit n] [:IsMap]] {:k n}))
+         (nil? (capture [:Has :k [:Lit n] [:IsMap]] {:k (inc n)})))))
+
+(law has-chains
+  (forall [a Int, b Int]
+    (= {'x a 'y b}
+       (capture [:Has :a [:Bind 'x] [:Has :b [:Bind 'y] [:IsMap]]] {:a a :b b}))))
+
+(law has-agrees-on-a-repeated-name
+  (forall [a Int]
+    (and (= {'x a} (capture [:Has :a [:Bind 'x] [:Has :b [:Bind 'x] [:IsMap]]] {:a a :b a}))
+         (nil? (capture [:Has :a [:Bind 'x] [:Has :b [:Bind 'x] [:IsMap]]] {:a a :b (inc a)})))))
+
+(law has-rejects-a-non-map
+  (forall [n Int] (nil? (capture has-k [:k n]))))
