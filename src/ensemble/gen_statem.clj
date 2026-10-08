@@ -1,6 +1,5 @@
 (ns ensemble.gen-statem
-  "The OTP gen_statem behaviour, in handle_event_function mode: one callback
-  receives every event with the current state and data.
+  "The OTP gen_statem behaviour.
 
   A machine is a record implementing Machine:
 
@@ -8,6 +7,13 @@
                       [:error reason] or :ignore
       (handle-event this type content state data)  -> a result
       (terminate this reason state data)
+
+  That is handle_event_function mode: one callback receives every event.  A
+  machine that also implements StateFunctions runs in state_functions mode
+  instead: (state-functions this) returns a map from each state to its fn,
+  called as (f type content data), and handle-event is not called.  An
+  event in a state with no fn stops the machine with
+  [:undefined-state-function state].
 
   An event's type is [:call from], :cast, :info, :timeout (the event
   timeout), :state-timeout, [:generic-timeout name], :internal (from a
@@ -34,19 +40,32 @@
   (handle-event [this type content state data] "Return a gen_statem result.")
   (terminate [this reason state data] "Run once as the machine stops."))
 
+(defprotocol StateFunctions
+  (state-functions [this] "A map from each state to its fn, (f type content data) -> a result."))
+
+(defn- callback
+  "Run the machine's callback for an event in state."
+  [m type content state data]
+  (if (satisfies? StateFunctions m)
+    (if-let [f (get (state-functions m) state)]
+      (f type content data)
+      (act/exit! [:undefined-state-function state]))
+    (handle-event m type content state data)))
+
 (def reply! gs/reply!)
 
 (defn- now [] (act/now-ms))
 
 (defn- arm
   "Timers as {key [deadline content]} from the pure timers {key [ms content]}
-  of this transition: a timer an action set starts now, one the transition
-  left alone keeps its deadline."
-  [touched pure deadlines]
-  (into {} (for [[k v] pure]
-             [k (if (and (not (contains? touched k)) (contains? deadlines k))
-                  (get deadlines k)
-                  [(+ (now) (first v)) (second v)])])))
+  of this transition: a timer the transition started runs from now, or to
+  its [:abs t] deadline; any other keeps its deadline, with the content an
+  update gave it."
+  [started pure deadlines]
+  (into {} (for [[k [ms content]] pure]
+             [k (if (and (not (contains? started k)) (contains? deadlines k))
+                  [(first (get deadlines k)) content]
+                  [(if (vector? ms) (second ms) (+ (now) ms)) content])])))
 
 (defn- finish
   "Run terminate with reason and exit with it, reporting an abnormal stop
@@ -96,7 +115,7 @@
   enter call on a state change.  Returns the machine's next st, or exits."
   [m opts st event kind]
   (let [[type content] event
-        ret (try (handle-event m type content (:state st) (:data st))
+        ret (try (callback m type content (:state st) (:data st))
                  (catch Throwable e [::crash (act/reason-of e)]))
         r (if (and (vector? ret) (= ::crash (first ret))) ret (sm/result-of kind ret (:state st) (:data st)))]
     (case (first r)
@@ -105,8 +124,8 @@
       :Stop (let [[_ reason replies data] r]
               (doseq [[from v] (map rest replies)] (reply! from v))
               (finish m reason (assoc st :data data) event))
-      :Transition
-      (let [[_ state data actions] r
+      (:Transition :Repeat)
+      (let [[tag state data actions] r
             [_ postpone? inserted replies timeouts] (sm/actions-of actions)
             changed? (not= state (:state st))
             [_ postponed queue] (if (= :enter kind)
@@ -116,10 +135,12 @@
             ;; the event timeout only runs while nothing is waiting to be handled
             timers (if (seq queue) (dissoc timers :event) timers)
             st* (assoc st :state state :data data :postponed postponed :queue queue
-                       :timers timers :deadlines (arm (set (map first timeouts)) timers (:deadlines st))
+                       :timers timers
+                       :deadlines (arm (sm/restarted changed? (:timers st) timeouts) timers (:deadlines st))
                        :hibernate (sm/hibernate? actions))]
         (doseq [[from v] replies] (reply! from v))
-        (if (and changed? (:state-enter opts))
+        ;; a repeat runs the enter call again as if the state were new
+        (if (and (or changed? (= :Repeat tag)) (:state-enter opts))
           (transition! m opts st* [:enter (:state st)] :enter)
           st*)))))
 
@@ -145,6 +166,20 @@
           :idle (hibernate! m opts parent st)
           (recur (transition! m opts st (second msg) :event)))))))
 
+(defn- begin
+  "Run the machine from state and data with init's actions, ack (if any)
+  delivered once they are taken.  Never returns."
+  [m opts parent ack state data actions]
+  (let [st {:state state :data data :postponed [] :queue [] :timers {} :deadlines {}}
+        [_ _ inserted replies timeouts] (sm/actions-of actions)
+        timers (sm/next-timers false {} timeouts)
+        st (assoc st :queue inserted :timers timers
+                  :deadlines (arm (sm/restarted false {} timeouts) timers {}))]
+    (doseq [[from v] replies] (reply! from v))
+    (when ack (deliver ack [:ok]))
+    (let [st (if (:state-enter opts) (transition! m opts st [:enter state] :enter) st)]
+      (run-loop m opts parent st))))
+
 (defn- run [m opts parent ack]
   (let [r (try (sm/init-of (init m))
                (catch Throwable e (let [why (act/reason-of e)] [:Fail why why])))
@@ -155,16 +190,19 @@
     (case (first r)
       :Ignore (quit! [:ignore] :normal)
       :Fail (let [[_ why exit] r] (quit! [:error why] exit))
-      :Start
-      (let [[_ state data actions] r
-            st {:state state :data data :postponed [] :queue [] :timers {} :deadlines {}}
-            [_ _ inserted replies timeouts] (sm/actions-of actions)
-            timers (sm/next-timers false {} timeouts)
-            st (assoc st :queue inserted :timers timers :deadlines (arm (set (map first timeouts)) timers {}))]
-        (doseq [[from v] replies] (reply! from v))
-        (deliver ack [:ok])
-        (let [st (if (:state-enter opts) (transition! m opts st [:enter state] :enter) st)]
-          (run-loop m opts parent st))))))
+      :Start (let [[_ state data actions] r]
+               (begin m opts parent ack state data actions)))))
+
+(defn enter-loop
+  "Make the calling actor machine m, in state with data, as gen_statem's
+  enter_loop: init is not called, and actions are taken as init's would
+  be.  opts are start's (:state-enter, :hibernate-after), and :parent, the
+  actor whose exit stops it.  Never returns."
+  ([m opts state data] (enter-loop m opts state data []))
+  ([m opts state data actions]
+   (let [as (sm/init-of [:ok state data actions])]
+     (when (= :Fail (first as)) (act/exit! (second as)))
+     (begin m opts (:parent opts) nil state data (nth as 3)))))
 
 (defn- start* [m {:keys [name trap timeout] :as opts} link?]
   (let [ack (promise)

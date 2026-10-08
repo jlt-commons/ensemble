@@ -5,7 +5,8 @@
   which timeouts are armed after the transition.
 
   An event is [type content].  A timer is keyed :event, :state or
-  [:generic name], and holds [ms content].")
+  [:generic name], and holds [ms content]; ms is [:abs t] for a deadline
+  on the monotonic clock.")
 
 (defn- timeout-ms [t] (if (= :infinity t) nil t))
 
@@ -13,6 +14,22 @@
   "A timeout's time: ms, or nil or :infinity, which cancel."
   [t]
   (if (integer? t) (not (neg? t)) (or (nil? t) (= :infinity t))))
+
+(defn- abs-opts?
+  "A timeout's options: a map whose :abs, if there, is a boolean."
+  [o]
+  (and (map? o) (or (not (contains? o :abs)) (boolean? (get o :abs)))))
+
+(defn- abs?
+  "Do a timeout's options make its time absolute?"
+  [o]
+  (true? (get o :abs)))
+
+(defn- abs-time?
+  "A time with its options: an absolute one may be any integer, as a
+  deadline on the clock is."
+  [t o]
+  (if (abs? o) (or (integer? t) (time? t)) (time? t)))
 
 (defn- event-type?
   "A type a :next-event may insert."
@@ -30,8 +47,18 @@
       :hibernate (if (and (= 2 n) (boolean? (second a))) :hibernate :bad)
       :next-event (if (and (= 3 n) (event-type? (second a))) :next-event :bad)
       :reply (if (= 3 n) :reply :bad)
-      (:timeout :state-timeout) (if (and (= 3 n) (time? (second a))) :timer :bad)
-      :generic-timeout (if (and (= 4 n) (time? (nth a 2))) :timer :bad)
+      (:timeout :state-timeout)
+      (cond
+        (= 2 n) (if (= :cancel (second a)) :timer :bad)
+        (= 3 n) (if (or (= :update (second a)) (time? (second a))) :timer :bad)
+        (= 4 n) (if (and (abs-opts? (nth a 3)) (abs-time? (second a) (nth a 3))) :timer :bad)
+        :else :bad)
+      :generic-timeout
+      (cond
+        (= 3 n) (if (= :cancel (nth a 2)) :timer :bad)
+        (= 4 n) (if (or (= :update (nth a 2)) (time? (nth a 2))) :timer :bad)
+        (= 5 n) (if (and (abs-opts? (nth a 4)) (abs-time? (nth a 2) (nth a 4))) :timer :bad)
+        :else :bad)
       :bad)))
 
 (defn- action-kind
@@ -86,7 +113,7 @@
 
 (defn- shape-of
   "A callback's return by its shape alone: [:T state data actions],
-  [:S reason replies data], or nil."
+  [:R state data actions] for a repeat, [:S reason replies data], or nil."
   [ret state data]
   (let [n (if (vector? ret) (count ret) 0)
         tag (when (pos? n) (first ret))
@@ -95,6 +122,8 @@
       (and (= :next-state tag) (<= 3 n 4)) [:T (nth ret 1) (nth ret 2) (acts 3)]
       (and (= :keep-state tag) (<= 2 n 3)) [:T state (nth ret 1) (acts 2)]
       (and (= :keep-state-and-data tag) (<= 1 n 2)) [:T state data (acts 1)]
+      (and (= :repeat-state tag) (<= 2 n 3)) [:R state (nth ret 1) (acts 2)]
+      (and (= :repeat-state-and-data tag) (<= 1 n 2)) [:R state data (acts 1)]
       (and (= :stop tag) (<= 2 n 3)) [:S (nth ret 1) [] (if (= 3 n) (nth ret 2) data)]
       (and (= :stop-and-reply tag) (<= 3 n 4)) [:S (nth ret 1) (nth ret 2) (if (= 4 n) (nth ret 3) data)]
       :else nil)))
@@ -102,7 +131,8 @@
 (defn result-of
   "What a callback's return ret means, given the current state and data.
   kind is :enter for a state enter call, else :event.
-  [:Transition state data actions], [:Stop reason replies data] or
+  [:Transition state data actions], [:Repeat state data actions] (keep the
+  state, and run its enter call again), [:Stop reason replies data] or
   [:Bad reason], the reason the machine stops with, as OTP names it."
   [kind ret state data]
   (let [sh (shape-of ret state data)]
@@ -116,7 +146,8 @@
              (= :Bad (first as)) [:Bad [:bad-reply-action-from-state-function (second as)]]
              not-reply [:Bad [:bad-reply-action-from-state-function (first not-reply)]]
              :else [:Stop why (second as) d]))
-      :T (let [[_ st d acts] sh
+      (:T :R)
+         (let [[tag st d acts] sh
                as (action-list acts)]
            (cond
              (= :Bad (first as)) [:Bad [:bad-action-from-state-function (second as)]]
@@ -125,16 +156,30 @@
              (and (= :enter kind) (first-of #{:postpone :next-event} (second as)))
              [:Bad [:bad-state-enter-action-from-state-function
                     (first (first-of #{:postpone :next-event} (second as)))]]
+             (= :R tag) [:Repeat st d (second as)]
              :else [:Transition st d (second as)])))))
 
+(defn- time-of
+  "A timer action's time as a timer holds it: ms, [:abs t], :update, or nil
+  to cancel."
+  [t opts]
+  (cond
+    (= :cancel t) nil
+    (= :update t) :update
+    (nil? (timeout-ms t)) nil
+    (abs? opts) [:abs t]
+    :else t))
+
 (defn- timer-of
-  "A timer action as [key ms content]."
+  "A timer action as [key time content]."
   [a]
-  (case (if (vector? a) (first a) :bare)
-    :bare [:event (timeout-ms a) a]
-    :timeout [:event (timeout-ms (nth a 1)) (nth a 2)]
-    :state-timeout [:state (timeout-ms (nth a 1)) (nth a 2)]
-    :generic-timeout [[:generic (nth a 1)] (timeout-ms (nth a 2)) (nth a 3)]))
+  (if (vector? a)
+    (let [[tag x y z w] a]
+      (case tag
+        (:timeout :state-timeout)
+        [({:timeout :event :state-timeout :state} tag) (time-of x z) (if (= :cancel x) nil y)]
+        :generic-timeout [[:generic x] (time-of y w) (if (= :cancel y) nil z)]))
+    [:event (timeout-ms a) a]))
 
 (defn actions-of
   "Split actions into [:Actions postpone? inserted replies timers], each list
@@ -172,12 +217,40 @@
       [:Queues [] (vec (concat inserted kept queue))]
       [:Queues kept (vec (concat inserted queue))])))
 
+(defn- set-timer
+  "ts with one timer action applied: a nil time cancels, :update changes a
+  running timer's content -- or starts one of time 0 -- and any other time
+  starts the timer."
+  [ts [k ms content]]
+  (cond
+    (nil? ms) (dissoc ts k)
+    (= :update ms) (if (contains? ts k) (assoc ts k [(first (get ts k)) content]) (assoc ts k [0 content]))
+    :else (assoc ts k [ms content])))
+
+(defn- carried
+  "The timers a transition starts from: the event timeout cleared, the state
+  timeout cleared on a state change."
+  [changed? timers]
+  (if changed? (dissoc timers :event :state) (dissoc timers :event)))
+
 (defn next-timers
   "The timers after a transition: the event timeout cleared, the state
-  timeout cleared on a state change, then each timer action applied in order
-  (a nil time cancels)."
+  timeout cleared on a state change, then each timer action applied in
+  order."
   [changed? timers timeouts]
-  (reduce (fn [ts [k ms content]]
-            (if (nil? ms) (dissoc ts k) (assoc ts k [ms content])))
-          (cond-> (dissoc timers :event) changed? (dissoc :state))
-          timeouts))
+  (reduce set-timer (carried changed? timers) timeouts))
+
+(defn restarted
+  "The keys of the timers a transition starts anew: those an action sets,
+  and those an update finds not running.  An update of a running timer
+  keeps its deadline, and a cancel ends whatever was started."
+  [changed? timers timeouts]
+  (second
+   (reduce (fn [[ts started] [k ms _ :as t]]
+             [(set-timer ts t)
+              (cond
+                (nil? ms) (disj started k)
+                (and (= :update ms) (contains? ts k)) started
+                :else (conj started k))])
+           [(carried changed? timers) #{}]
+           timeouts)))

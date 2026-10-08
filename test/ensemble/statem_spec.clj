@@ -14,18 +14,27 @@
       [:next-state s d]        [:next-state s d actions]
       [:keep-state d]          [:keep-state d actions]
       [:keep-state-and-data]   [:keep-state-and-data actions]
+      [:repeat-state d]        [:repeat-state d actions]
+      [:repeat-state-and-data] [:repeat-state-and-data actions]
       [:stop reason]           [:stop reason d]
       [:stop-and-reply reason replies]   [:stop-and-reply reason replies d]
 
   and anything else stops the machine with {bad_return_from_state_function,
-  Ret}.  A state enter call may not change the state
+  Ret}.  A repeat keeps the state as keep does, and runs the state enter
+  call again as if the state had been entered anew: [:Repeat s d actions].  A state enter call may not change the state
   ({bad_state_enter_return_from_state_function, Ret}), postpone, or insert
   events ({bad_state_enter_action_from_state_function, Action}).
 
   Actions: :postpone or [:postpone bool], [:next-event type content],
   [:reply from value], [:timeout ms content] (the event timeout), a bare
   time ms (short for [:timeout ms ms]), [:state-timeout ms content],
-  [:generic-timeout name ms content].  A time of nil or :infinity cancels.
+  [:generic-timeout name ms content].  A time of nil or :infinity cancels,
+  as does [:timeout :cancel], [:state-timeout :cancel] or
+  [:generic-timeout name :cancel].  [:timeout :update content] (and the
+  same for the others) changes a running timer's content and leaves its
+  time; with no such timer it starts one of time 0.  An options map after
+  the content, {:abs true}, makes the time an absolute deadline on the
+  monotonic clock, kept as [:abs t].
   :hibernate or [:hibernate bool]: hibernate before waiting for the next
   event; of several, the last decides.  Where a list of actions goes, one
   action alone may go instead, as OTP's [action()] | action().  An action
@@ -53,6 +62,7 @@
 
 (data Result
   (Transition Any Any (Vec Any))
+  (Repeat Any Any (Vec Any))
   (Stop Any (Vec Any) Any)
   (Bad Any))
 
@@ -74,10 +84,11 @@
 (ann first-of [(Set Keyword) (List Any) -> (Opt (Vec Any))])
 (ann next-queues [Bool Bool Any (Vec Any) (Vec Any) (Vec Any) -> Queues])
 (ann next-timers [Bool (Map Any Any) (Vec Any) -> (Map Any Any)])
+(ann restarted [Bool (Map Any Any) (Vec Any) -> (Set Any)])
 
 ;; --- the state graph ----------------------------------------------------
 
-(refine Transitions [r Result] (= :Transition (first r)))
+(refine Transitions [r Result] (contains? #{:Transition :Repeat} (first r)))
 (refine Stops       [r Result] (= :Stop (first r)))
 (refine Bad         [r Result] (= :Bad (first r)))
 
@@ -119,6 +130,24 @@
          (= (result-of :event [:keep-state-and-data] st d) [:Transition st d []])
          (= (result-of :event [:keep-state-and-data [[:reply from 1]]] st d)
             [:Transition st d [[:reply from 1]]]))))
+
+(law repeat-keeps-the-state
+  (forall [st Any, d Any, ms Nat]
+    (and (= (result-of :event [:repeat-state d] st :d0) [:Repeat st d []])
+         (= (result-of :event [:repeat-state d [ms]] st :d0) [:Repeat st d [ms]])
+         (= (result-of :event [:repeat-state-and-data] st d) [:Repeat st d []])
+         (= (result-of :event [:repeat-state-and-data :postpone] st d) [:Repeat st d [:postpone]]))))
+
+(law an-enter-call-may-repeat
+  (= (result-of :enter [:repeat-state :d1] :s :d) [:Repeat :s :d1 []]))
+
+(law a-repeat-takes-only-actions
+  (and (= (result-of :event [:repeat-state :d [:bogus]] :s :d)
+          [:Bad [:bad-action-from-state-function :bogus]])
+       (= (result-of :event [:repeat-state] :s :d)
+          [:Bad [:bad-return-from-state-function [:repeat-state]]])
+       (= (result-of :enter [:repeat-state-and-data :postpone] :s :d)
+          [:Bad [:bad-state-enter-action-from-state-function :postpone]])))
 
 (law stop-forms
   (forall [why Any, d Any]
@@ -185,7 +214,33 @@
        (= (result-of :event [:keep-state-and-data [[:timeout -1 :x]]] :s :d)
           [:Bad [:bad-action-from-state-function [:timeout -1 :x]]])
        (= (result-of :event [:keep-state-and-data [[:next-event :bogus 1]]] :s :d)
-          [:Bad [:bad-action-from-state-function [:next-event :bogus 1]]])))
+          [:Bad [:bad-action-from-state-function [:next-event :bogus 1]]])
+       (= (result-of :event [:keep-state-and-data [[:timeout :cancel :x]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:timeout :cancel :x]]])
+       (= (result-of :event [:keep-state-and-data [[:state-timeout :update]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:state-timeout :update]]])
+       (= (result-of :event [:keep-state-and-data [[:timeout 5 :x {:abs :yes}]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:timeout 5 :x {:abs :yes}]]])
+       (= (result-of :event [:keep-state-and-data [[:generic-timeout :g :cancel :x]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:generic-timeout :g :cancel :x]]])
+       (= (result-of :event [:keep-state-and-data [[:generic-timeout :g :never]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:generic-timeout :g :never]]])
+       (= (result-of :event [:keep-state-and-data [[:generic-timeout :g]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:generic-timeout :g]]])
+       (= (result-of :event [:keep-state-and-data [[:generic-timeout :g 1 :x {:abs 1}]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:generic-timeout :g 1 :x {:abs 1}]]])
+       (= (result-of :event [:keep-state-and-data [[:generic-timeout :g 1 :x {} :y]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:generic-timeout :g 1 :x {} :y]]])))
+
+(law cancel-update-and-abs-are-timer-actions
+  (= (result-of :event [:keep-state-and-data [[:timeout :cancel] [:state-timeout :update :c]
+                                              [:generic-timeout :g :cancel] [:generic-timeout :g :update :c]
+                                              [:timeout 5 :x {:abs true}] [:state-timeout 5 :x {}]
+                                              [:generic-timeout :g -5 :x {:abs true}]]] :s :d)
+     [:Transition :s :d [[:timeout :cancel] [:state-timeout :update :c]
+                         [:generic-timeout :g :cancel] [:generic-timeout :g :update :c]
+                         [:timeout 5 :x {:abs true}] [:state-timeout 5 :x {}]
+                         [:generic-timeout :g -5 :x {:abs true}]]]))
 
 (law stop-and-reply-takes-only-replies
   (= (result-of :event [:stop-and-reply :why [[:reply from 1] :postpone]] :s :d)
@@ -232,6 +287,15 @@
 (law each-timeout-kind
   (= (actions-of [[:timeout 5 :a] [:state-timeout 6 :b] [:generic-timeout :g 7 :c]])
      [:Actions false [] [] [[:event 5 :a] [:state 6 :b] [[:generic :g] 7 :c]]]))
+
+(law cancel-update-and-abs-parse
+  (= (actions-of [[:timeout :cancel] [:state-timeout :update :c] [:generic-timeout :g :cancel]
+                  [:generic-timeout :g :update :c] [:timeout 5 :x {:abs true}]
+                  [:state-timeout 6 :y {:abs false}] [:generic-timeout :g 7 :z {:abs true}]
+                  [:timeout :infinity :w {:abs true}]])
+     [:Actions false [] []
+      [[:event nil nil] [:state :update :c] [[:generic :g] nil nil] [[:generic :g] :update :c]
+       [:event [:abs 5] :x] [:state 6 :y] [[:generic :g] [:abs 7] :z] [:event nil :w]]]))
 
 (law infinity-is-a-cancel
   (= (actions-of [[:timeout :infinity :a]]) [:Actions false [] [] [[:event nil :a]]]))
@@ -305,6 +369,33 @@
   (forall [changed Bool]
     (and (= (next-timers changed {[:generic :g] [5 :a]} [[[:generic :g] nil :x]]) {})
          (= (next-timers false {:state [5 :a]} [[:state nil :x]]) {}))))
+
+(law an-update-changes-only-the-content
+  (forall [changed Bool]
+    (= (next-timers changed {[:generic :g] [5 :a]} [[[:generic :g] :update :b]])
+       {[:generic :g] [5 :b]})))
+
+(law an-update-with-no-timer-starts-one-of-time-0
+  (and (= (next-timers true {:state [5 :a]} [[:state :update :b]]) {:state [0 :b]})
+       (= (next-timers false {:event [5 :a]} [[:event :update :b]]) {:event [0 :b]})))
+
+(law an-abs-time-is-kept
+  (= (next-timers false {} [[:state [:abs 9] :a]]) {:state [[:abs 9] :a]}))
+
+;; which timers a transition starts anew, so the runtime knows which to
+;; arm from now and which keep their deadline
+(law restarted-names-what-the-actions-start
+  (and (= (restarted false {:state [5 :a]} [[:event 3 :e]]) #{:event})
+       (= (restarted false {:state [5 :a]} [[:state :update :b]]) #{})
+       (= (restarted true {:state [5 :a]} [[:state :update :b]]) #{:state})
+       (= (restarted false {:state [5 :a]} [[:state 1 :b] [:state :update :c]]) #{:state})
+       (= (restarted false {} [[:state 1 :b] [:state nil nil]]) #{})))
+
+(law restarted-is-within-the-timers
+  (every? (fn [[changed ts acts]] (every? (set (keys (next-timers changed ts acts))) (restarted changed ts acts)))
+          [[false {} [[:event 1 :a] [:state :update :b]]]
+           [true {:state [1 :a]} [[:state :update :b] [[:generic :g] nil nil]]]
+           [false {[:generic :g] [1 :a]} [[[:generic :g] 2 :b] [[:generic :g] nil nil]]]]))
 
 (law the-last-action-for-a-timer-wins
   (= (next-timers false {} [[:state 1 :a] [:state 2 :b]]) {:state [2 :b]}))
