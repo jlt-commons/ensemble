@@ -174,16 +174,19 @@
   (not= ::closed coll))
 
 (defn alive?
-  "True until the actor has exited (Erlang's is_process_alive)."
+  "True until the local actor has exited (Erlang's is_process_alive).  A
+  process of another node is a badarg, as in Erlang."
   [actor]
-  (open? @(::links actor)))
+  (if (actor? actor)
+    (open? @(::links actor))
+    (throw (ex-info "alive? takes a local process" {:reason :badarg :process actor}))))
 
 (defn whereis
   "The live actor registered under nm on this node, or nil.  nm may be a
   name in another registry, [:via r name]."
   [nm]
-  (if (reg/via? nm)
-    (let [[_ r n] nm] (reg/whereis-name r n))
+  (if (or (reg/via? nm) (reg/global? nm))
+    (let [[_ r n] (reg/named nm)] (reg/whereis-name r n))
     (let [a (get-in @registry [(node) (norm-name nm)])]
       (when (and a (alive? a)) a))))
 
@@ -232,7 +235,7 @@
   [dest]
   (cond
     (pid? dest) dest
-    (reg/via? dest)
+    (or (reg/via? dest) (reg/global? dest))
     (or (whereis dest)
         (throw (ex-info "no process registered under name" {:reason :badarg :name dest})))
     (and (vector? dest) (= :At (first dest)))
@@ -470,6 +473,7 @@
   (let [me (self)
         ;; a registry's name is looked up, as gen_server does before it
         ;; monitors: the DOWN names the process
+        dest (reg/named dest)
         dest (if (reg/via? dest) (or (whereis dest) dest) dest)
         obj (when-not (or (pid? dest) (reg/via? dest)) (name-object dest))
         obj (if (reg/via? dest) dest obj)
@@ -575,7 +579,8 @@
         [mons _]  (swap-vals! (::monitors me) (constantly ::closed))]
     (swap! registry update (::node me) (fn [r] (into {} (remove (fn [[_ v]] (= v me))) r)))
     (when-let [[_ r n] (:via @(::origin me))]
-      (try (reg/unregister-name r n) (catch Throwable _ nil)))
+      (when-not (and (satisfies? reg/Watches r) (reg/watches-its-processes? r))
+        (try (reg/unregister-name r n) (catch Throwable _ nil))))
     (doseq [[ref target] @(::monitoring me) :when (watched? target)] (proc/-drop-monitor target ref))
     (swap! procs dissoc (::pid me))
     (doseq [other links]
@@ -826,13 +831,21 @@
                             :ancestors (if parent (into [parent] (:ancestors @(::origin parent))) [])})
      (when trap (reset! (::trapping me) true))
      (reset! (::state me) (:state opts))
-     (if (reg/via? name)
-       (let [[_ r n] name]
-         (if (reg/register-name r n me)
-           (swap! (::origin me) assoc :via name)
-           (throw (ex-info "name already registered" {:reason :badarg :name name}))))
-       (when name (register! name me)))
+     ;; in the process table before its name is registered: a registry may
+     ;; reach for it, a monitor from another node among others
      (swap! procs assoc (::pid me) me)
+     (try
+       (if (reg/via? (reg/named name))
+         (let [[_ r n :as via] (reg/named name)]
+           (if (reg/register-name r n me)
+             (swap! (::origin me) assoc :via via)
+             (throw (ex-info "name already registered" {:reason :badarg :name name}))))
+         (when name (register! name me)))
+       (catch Throwable e
+         ;; it never runs: anything that reached for it sees it gone
+         (settle! me :noproc)
+         (deliver (::done me) [:err e :noproc])
+         (throw e)))
      (when (and link parent)
        (swap! (::links me) conj parent)
        (swap! (::links parent) (fn [ls] (if (open? ls) (conj ls me) ls))))

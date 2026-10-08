@@ -209,6 +209,15 @@
 
 (declare nodedown! handle-frame)
 
+(defn- tell-watchers!
+  "Send msg to every actor of node n that monitors all nodes."
+  [n msg]
+  (binding [act/*node* n]
+    (doseq [id (:node-watchers (state n))]
+      (if-let [w (act/local-actor id)]
+        (proc/-deliver w msg)
+        (swap! nodes update-in [n :node-watchers] disj id)))))
+
 (defn connected
   "The peers node n is connected to."
   ([] (connected (act/node)))
@@ -237,7 +246,8 @@
       :Up (let [peer (:peer hs)]
             (swap! nodes assoc-in [n :conns peer] {:conn c :creation (:peer-creation hs)})
             (swap! sess assoc :hs hs :peer peer)
-            (when done (deliver done [:up c])))
+            (when done (deliver done [:up c]))
+            (tell-watchers! n [:nodeup peer]))
       :Fail (do (swap! sess assoc :failed hs)
                 (tr/-close c)
                 (when done (deliver done [:failed hs]))))))
@@ -438,6 +448,15 @@
        (ifn? allow) (allow sym)
        :else false))))
 
+(defn outcome
+  "What running (f) came to, as erpc reports it: [:ok value], [:exit
+  reason] for an exit, or [:exception throwable]."
+  [f]
+  (try [:ok (f)]
+       (catch Throwable e
+         (let [r (act/reason-of e)]
+           (if (identical? r e) [:exception e] [:exit r])))))
+
 (defn handle-frame
   "Perform, as node n, the operation frame from peer asks for.  Only a
   peer that passed the handshake gets here."
@@ -468,14 +487,17 @@
                      (when a (proc/-drop-monitor a ref)))
         :fired (let [[ref reason] args] (fire! n ref reason))
         :alias (let [[alias msg] args] (act/send-alias! alias msg))
-        :spawn (let [[ref sym fargs link from] args]
+        :spawn (let [[ref sym fargs link from reply] args]
                  (if-not (spawn-allowed? n sym)
                    (send-frame! n peer [:spawned ref [:refused sym]])
                    (let [f (requiring-resolve sym)
                          ;; the link is made by the new process before it runs a
                          ;; step, so a crash at once still reaches the spawner
                          go (promise)
-                         a (act/spawn (fn [] @go (when link (act/link! from)) (apply f fargs)))]
+                         a (act/spawn (fn [] @go (when link (act/link! from))
+                                        (if reply
+                                          (proc/-deliver from [::result reply (outcome #(apply f fargs))])
+                                          (apply f fargs))))]
                      (send-frame! n peer [:spawned ref a])
                      (deliver go true))))
         :spawned (let [[ref pid] args]
@@ -510,9 +532,22 @@
                          (fire! n (second msg) :noconnection)
                          (when-let [a (act/local-actor me)] (proc/-deliver a msg))))
             nil))
-        (swap! nodes update-in [n :node-mons] (fn [ms] (vec (remove #(= peer (second %)) ms))))))))
+        (swap! nodes update-in [n :node-mons] (fn [ms] (vec (remove #(= peer (second %)) ms))))
+        (tell-watchers! n [:nodedown peer])))))
 
 ;; --- the API ------------------------------------------------------------
+
+(defonce ^:private start-hooks
+  ;; key -> (fn [node]), run as each node starts: the services it runs
+  (atom {}))
+
+(defn on-start!
+  "Run (f node) as every node starts from now on, under key k (a second
+  call with k replaces the first).  How a service -- global, pg -- runs
+  on each node."
+  [k f]
+  (swap! start-hooks assoc k f)
+  nil)
 
 (defn start!
   "Start node name in this VM, reachable over transport.  Code that runs
@@ -538,12 +573,15 @@
                           :codec (or (:codec opts) (codec/edn))
                           :auth (or (:auth opts) (cookie-auth (or (:cookie opts) vm-cookie)))
                           :creation (fresh-creation)})
-   (swap! nodes assoc-in [nm :listener] (tr/-listen transport nm (fn [c] (accept! nm c))))
    (act/set-remote-resolver! (fn [[_ remote-nm peer]] (->RemoteName peer remote-nm)))
    (act/set-peers-fn! (fn [] (connected (act/node))))
    (act/set-creation-fn! creation)
    (act/set-remote-alias-sender! (fn [alias msg]
                                    (send-frame! (act/node) (:ensemble.actor/owner-node alias) [:alias alias msg])))
+   ;; the services start before a peer can connect
+   (binding [act/*node* nm]
+     (doseq [[_ f] @start-hooks] (f nm)))
+   (swap! nodes assoc-in [nm :listener] (tr/-listen transport nm (fn [c] (accept! nm c))))
    nm))
 
 (defn stop!
@@ -575,6 +613,16 @@
     (tr/-close c))
   true)
 
+(defn monitor-nodes!
+  "With on true, the current actor receives [:nodeup peer] and [:nodedown
+  peer] whenever its node connects to or loses a peer, as
+  net_kernel:monitor_nodes; with false, no longer."
+  [on]
+  (let [n (act/node)
+        me (proc/-pid (act/self))]
+    (swap! nodes update-in [n :node-watchers] (fnil (if on conj disj) #{}) me)
+    true))
+
 (defn monitor-node!
   "Receive [:nodedown peer] in the current actor when the connection to
   peer is lost; at once if there is none, as monitor_node(Node, true)."
@@ -590,15 +638,17 @@
   "Start a process on node peer running (apply f args), f named by a
   symbol peer can resolve and allows (see start!'s :spawn), as
   spawn(Node, M, F, A).  With {:link true} it is linked to the current
-  actor.  Returns its pid, a RemotePid; throws {:reason [:not-allowed
+  actor; with {:reply r} it sends the current actor [::result r outcome]
+  when (apply f args) is done (see outcome), as erpc's processes do.
+  Returns its pid, a RemotePid; throws {:reason [:not-allowed
   sym]} when peer refuses."
   ([peer f-sym args] (spawn-on peer f-sym args {}))
-  ([peer f-sym args {:keys [link timeout] :or {timeout 5000}}]
+  ([peer f-sym args {:keys [link timeout reply] :or {timeout 5000}}]
    (let [n (act/node)
          ref (act/make-ref)
          p (promise)]
      (swap! nodes assoc-in [n :spawns ref] p)
-     (when-not (send-frame! n peer [:spawn ref f-sym (vec args) (boolean link) (act/self)])
+     (when-not (send-frame! n peer [:spawn ref f-sym (vec args) (boolean link) (act/self) reply])
        (swap! nodes update-in [n :spawns] dissoc ref)
        (throw (ex-info "cannot reach node" {:reason :noconnection :node peer})))
      (let [t (act/timeout-ms timeout)
