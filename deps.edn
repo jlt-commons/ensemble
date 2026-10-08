@@ -4,7 +4,7 @@
  {:test {:extra-paths ["test"]
          :extra-deps  {io.github.jlt-commons/writ
                        {:git/url "https://github.com/jlt-commons/writ"
-                        :git/sha "35ae2bbd43ed760f21cb0595bb399c1e01632a76"}}
+                        :git/sha "4055b495575e5ddd806b155e25a6678b31153761"}}
          :main-opts   ["-m" "ensemble.runner"]}
   :bench {:extra-paths ["bench"]
           :main-opts   ["-m" "ensemble.bench"]}}}
