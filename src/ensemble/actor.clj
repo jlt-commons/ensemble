@@ -41,6 +41,7 @@
             [jolt.fs :as fs]
             [jolt.image :as image]
             [ensemble.life :as life]
+            [ensemble.logger :as logger]
             [ensemble.process :as proc]
             [ensemble.pattern :as pattern]
             [ensemble.select :as select]
@@ -100,6 +101,12 @@
 
 (defmethod print-method ::actor [x ^java.io.Writer w]
   (.write w (str "#<actor " (::pid x) ">")))
+
+(defn now-ms
+  "Milliseconds of a monotonic clock, for timeouts and deadlines: unlike the
+  wall clock it never steps, as erlang:monotonic_time(millisecond)."
+  []
+  (quot (System/nanoTime) 1000000))
 
 (defonce ^:private counter (atom 0))
 
@@ -161,6 +168,11 @@
                  (throw (ex-info "actor already has a name" {:reason :badarg :name nm}))
                  :else (assoc-in all [n k] actor)))))
     actor))
+
+(defn registered-name
+  "The name actor is registered under, or nil."
+  [actor]
+  (some (fn [[k v]] (when (= v actor) k)) (get @registry (::node actor))))
 
 (defn unregister!
   "Release the name nm.  Returns nil."
@@ -535,6 +547,11 @@
                                   (contains? r :ok) :normal
                                   :else (reason-of (:err r)))]
                  (swap! (::lifecycle me) life/step [:Exit])
+                 ;; a throw the body did not catch is a crash, and is reported,
+                 ;; as the emulator reports an uncaught error; an exit is not
+                 (when (and (not killed) (instance? Throwable reason))
+                   (logger/report! {:level :error :kind :crash-report :pid me
+                                    :name (registered-name me) :reason reason}))
                  (settle! me reason)
                  (deliver (::done me)
                           (if (sig/normal? reason)

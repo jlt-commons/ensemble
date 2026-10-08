@@ -53,3 +53,16 @@
   (let [top (:top (get @@#'app/running ::perm))]
     (act/! (sup/child top :w) :die)
     (is (eventually #(not (app/started? ::victim))))))
+
+(deftest applications-stop-in-reverse-start-order
+  (let [log (atom [])
+        names (mapv #(keyword "ensemble.application-test" (str "chain" %)) (range 8))]
+    (doseq [[i n] (map-indexed vector names)]
+      (app/load! (spec n :applications (if (pos? i) [(nth names (dec i))] [])
+                       :type (if (= i 7) :permanent :temporary)
+                       :stop (fn [_] (swap! log conj i)))))
+    (app/ensure-all-started! (peek names))
+    (let [top (:top (get @@#'app/running (peek names)))]
+      (act/! (sup/child top :w) :die)
+      (is (eventually #(= 7 (count @log))))
+      (is (= [6 5 4 3 2 1 0] @log)))))

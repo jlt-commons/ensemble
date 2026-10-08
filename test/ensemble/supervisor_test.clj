@@ -417,3 +417,16 @@
         p (future (sup/terminate-child! sup :stubborn))]
     (is (= :ok (deref p 2000 :hung)))
     (is (= :killed (act/exit-reason c 1000)))))
+
+(deftest dynamic-children-are-shut-down-together
+  ;; five children that ignore :shutdown, 300 ms each: one at a time would
+  ;; take 1.5 s, together they take one shutdown time
+  (let [sup (sup/start {:strategy :simple-one-for-one}
+                       [{:id :t :shutdown 300
+                         :start (fn [] (act/spawn-link (fn [] (loop [] (receive [_ nil]) (recur)))
+                                                       {:trap true}))}])
+        kids (doall (for [_ (range 5)] (sup/start-child! sup [])))
+        t0 (System/currentTimeMillis)]
+    (sup/stop! sup)
+    (is (< (- (System/currentTimeMillis) t0) 900))
+    (is (every? #(= :killed (act/exit-reason % 1000)) kids))))

@@ -148,7 +148,7 @@
 
 (defrecord Idle [limit log]
   gs/Server
-  (init [_] [:ok 0])
+  (init [_] [:ok 0 limit])
   (handle-call [_ _ _ st] [:reply st st limit])
   (handle-cast [_ _ st] [:noreply st limit])
   (handle-info [_ _ st] [:noreply st limit])
@@ -157,7 +157,7 @@
 
 (deftest a-returned-timeout-runs-handle-timeout
   (let [log (atom [])
-        s (gs/start (->Idle 30 log) {:timeout 30})]
+        s (gs/start (->Idle 30 log))]
     (is (= :idle (act/exit-reason s 1000)))
     (is (= [:idle] @log))))
 
@@ -400,3 +400,33 @@
                                         [r2 l2 c] (gs/receive-response c 1000 true)]
                                     [#{[r1 l1] [r2 l2]} (gs/reqids-size c) (gs/receive-response c 10 true)])))
                      2000)))))
+
+;; --- start's :timeout bounds init, as OTP's {timeout, T} -----------------
+
+(defrecord SlowInit [ms]
+  gs/Server
+  (init [_] (a/<!! (a/timeout ms)) [:ok :up])
+  (handle-call [_ _ _ st] [:reply st st])
+  (handle-cast [_ _ st] [:noreply st])
+  (handle-info [_ _ st] [:noreply st])
+  (handle-timeout [_ st] [:noreply st])
+  (handle-continue [_ _ st] [:noreply st])
+  (terminate [_ _ _] nil))
+
+(deftest an-init-that-takes-too-long-fails-the-start-with-timeout
+  (let [t0 (System/currentTimeMillis)
+        r (try (gs/start (->SlowInit 5000) {:timeout 100 :name ::slow})
+               (catch Throwable e (:reason (ex-data e))))]
+    (is (= :timeout r))
+    (is (< (- (System/currentTimeMillis) t0) 2000))
+    (is (nil? (act/whereis ::slow)))))
+
+(deftest an-init-within-the-timeout-starts
+  (let [s (gs/start (->SlowInit 20) {:timeout 1000})]
+    (is (= :up (gs/call! s :get)))
+    (gs/stop! s)))
+
+(deftest a-start-link-whose-init-times-out-does-not-kill-the-caller
+  (let [c (act/spawn (fn [] (try (gs/start-link (->SlowInit 5000) {:timeout 50})
+                                 (catch Throwable e (:reason (ex-data e))))))]
+    (is (= :timeout (act/join c 2000)))))
