@@ -215,11 +215,12 @@
         [_ _ out-a] (handshake ia [:challenge :m.vm 9 cc] (ctx-for "k" :ca))]
     (= [:Fail :bad-cookie []] (handshake hc (first out-a) (ctx-for "k" :cc)))))
 
-;; nor does an end's own challenge, reflected back to it, prove the peer
+;; nor does an end's own challenge, reflected back to it, prove the peer:
+;; b sends a's challenge as its own, and hands a's answer back as the ack
 (law a-reflected-ack-is-refused
   (let [ctx (ctx-for "k" :ca)
         [_ ia] (handshake (second (open-handshake :a.vm 1 :b.vm)) [:status :ok] ctx)
-        [_ ia out-a] (handshake ia [:challenge :b.vm 2 :cb] ctx)
+        [_ ia out-a] (handshake ia [:challenge :b.vm 2 :ca] ctx)
         ;; what a signed for b, sent back to a as b's proof
         [_ _ sig] (first out-a)]
     (= [:Fail :bad-cookie []] (handshake ia [:ack sig] ctx))))
