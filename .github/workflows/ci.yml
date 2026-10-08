@@ -6,15 +6,15 @@ on:
   workflow_dispatch:
     inputs:
       jolt-version:
-        description: "jolt version to install (blank = the pinned JOLT_VERSION below)"
+        description: "jolt version to install (blank = nightly)"
         required: false
         default: ""
 
-# pinned, as across jlt-commons: a floating latest lets a new jolt release
-# turn CI red on a tree nobody touched.  The dispatch input overrides it for
-# one run, to try a candidate release
+# jolt's rolling nightly build of main: ensemble follows the runtime it needs
+# (jolt.fibers/kill!) as it lands, ahead of a release.  The dispatch input
+# overrides it for one run, to try a particular release
 env:
-  JOLT_VERSION: ${{ inputs.jolt-version || 'v0.8.18' }}
+  JOLT_VERSION: ${{ inputs.jolt-version || 'nightly' }}
 
 jobs:
   test:

@@ -17,7 +17,8 @@ Not published yet, so point at the git repo:
 ```
 
 It needs a jolt with fiber kills (`jolt.fibers/kill!`), which no `catch`
-can stop: a release after 0.8.19.
+can stop: the nightly build (`install --version nightly`) until a release
+after 0.8.19 has them. CI runs against the nightly.
 
 ## Processes
 
