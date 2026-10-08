@@ -211,3 +211,20 @@
   (let [m (sm/start (->Actions))]
     (gs/cast! m :junk)
     (is (= [:bad-return-from-state-function :junk] (act/exit-reason m 1000)))))
+
+(defrecord SlowM [ms]
+  sm/Machine
+  (init [_] (sleep ms) [:ok :s nil])
+  (handle-event [_ type _ _ _]
+    (if (vector? type) [:keep-state-and-data [[:reply (second type) :here]]] [:keep-state-and-data]))
+  (terminate [_ _ _ _] nil))
+
+(deftest a-statem-init-that-takes-too-long-fails-with-timeout
+  (is (= :timeout (try (sm/start (->SlowM 5000) {:timeout 100})
+                       (catch Throwable e (:reason (ex-data e)))))))
+
+(deftest hibernate-after-hibernates-an-idle-machine
+  (let [m (sm/start (->SlowM 0) {:hibernate-after 30})]
+    (is (eventually #(act/hibernating? m)))
+    (is (= :here (gs/call! m :where)))
+    (gs/stop! m)))

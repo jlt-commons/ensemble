@@ -43,7 +43,17 @@
   (:require [ensemble.actor :as act :refer [receive]]
             [ensemble.childspec :as cs]
             [ensemble.gen-server :as gs]
-            [ensemble.order :as ord]))
+            [ensemble.logger :as logger]
+            [ensemble.order :as ord]
+            [ensemble.signal :as sig]))
+
+(defn- report!
+  "A supervisor report: context, as OTP names it, reason and the child."
+  [context reason child]
+  (logger/report! {:level :error :kind :supervisor-report :context context
+                   :supervisor (act/self) :name (act/registered-name (act/self))
+                   :reason reason
+                   :child (select-keys child [:id :actor :restart :shutdown :type])}))
 
 (defn- child-of
   "A running child from a checked spec: key is how the supervisor knows it,
@@ -87,20 +97,56 @@
         :else [:Stopped]))
 
 (defn- shutdown-child
-  "Stop a running child as OTP does, and return the child with no actor."
+  "Stop a running child as OTP does, and return the child with no actor.  A
+  child that ends other than as it was told -- killed after its shutdown
+  time, or exiting with its own reason -- is a shutdown_error."
   [child]
   (when-let [a (:actor child)]
     (let [ref (act/monitor! a)
-          how (:shutdown child)]
+          how (:shutdown child)
+          expected (if (= :brutal-kill how) :killed :shutdown)]
       (act/unlink! a)
       (receive [[:EXIT a _] nil] [:after 0 nil])
       (act/exit! a (if (= :brutal-kill how) :kill :shutdown))
-      (receive
-       [[:DOWN ref :process _ _] nil]
-       [:after (when (int? how) how)
-        (act/exit! a :kill)
-        (receive [[:DOWN ref :process _ _] nil])])))
+      (let [reason (receive
+                    [[:DOWN ref :process _ why] why]
+                    [:after (when (int? how) how)
+                     (act/exit! a :kill)
+                     (receive [[:DOWN ref :process _ why] why])])]
+        (when-not (contains? #{expected :noproc} reason)
+          (report! :shutdown-error reason child)))))
   (assoc child :actor nil))
+
+(defn- shutdown-together
+  "Stop the running children all at once, as OTP stops a
+  :simple-one-for-one supervisor's: each is unlinked and sent :shutdown
+  (killed, for :brutal-kill), then all are waited for under one shutdown
+  time, and those still running then are killed.  Returns the children
+  with no actor."
+  [children]
+  (let [running (filterv :actor children)
+        how (:shutdown (first running))
+        watched (into {} (for [c running
+                               :let [a (:actor c)
+                                     mref (act/monitor! a)]]
+                           (do (act/unlink! a)
+                               (receive [[:EXIT a _] nil] [:after 0 nil])
+                               (act/exit! a (if (= :brutal-kill how) :kill :shutdown))
+                               [mref a])))
+        deadline (when (int? how) (+ (act/now-ms) how))
+        await (fn [left t]
+                (receive
+                 [[:DOWN mref :process _ _] :when (contains? left mref) mref]
+                 [:after t ::late]))]
+    (loop [left watched]
+      (when (seq left)
+        (let [r (await left (when deadline (max 0 (- deadline (act/now-ms)))))]
+          (if (= ::late r)
+            (do (run! (fn [a] (act/exit! a :kill)) (vals left))
+                (loop [left left]
+                  (when (seq left) (recur (dissoc left (await left nil))))))
+            (recur (dissoc left r))))))
+    (mapv #(assoc % :actor nil) children)))
 
 (defn- stop-all [children]
   (reduce (fn [cs k] (put-child cs (shutdown-child (by-key cs k))))
@@ -126,7 +172,8 @@
                 (case (first kept)
                   :Add (put-child cs (assoc c :actor (second kept) :restarting false))
                   :Skip (drop-child cs sk)
-                  :Refuse (do (act/! (act/self) [::retry sk])
+                  :Refuse (do (report! :start-error (second kept) c)
+                              (act/! (act/self) [::retry sk])
                               (put-child cs (assoc c :restarting true))))))
             kept start)))
 
@@ -141,12 +188,17 @@
   [{:keys [strategy intensity period auto-shutdown]} st child reason]
   (let [cs (:children st)
         k (:key child)]
+    ;; as OTP: a permanent child's every end, any other's unless orderly
+    (when (and (not= :start-failed reason)
+               (or (= :permanent (:restart child)) (not (sig/shutdown? reason))))
+      (report! :child-terminated reason child))
     (if (ord/restart? (:restart child) reason)
-      (let [[verdict times] (ord/intensity (:restarts st) (System/currentTimeMillis)
+      (let [[verdict times] (ord/intensity (:restarts st) (act/now-ms)
                                            (* 1000 period) intensity)
             st (assoc st :restarts times)]
         (if (= :Exceed verdict)
-          [:stop :shutdown (assoc st :children (put-child cs (assoc child :actor nil)))]
+          (do (report! :shutdown :reached-max-restart-intensity child)
+              [:stop :shutdown (assoc st :children (put-child cs (assoc child :actor nil)))])
           [:noreply (assoc st :children
                            (restart strategy (put-child cs (assoc child :actor nil)) k))]))
       (let [cs (if (or (= :temporary (:restart child)) (= :simple-one-for-one strategy))
@@ -201,7 +253,9 @@
               (case (first kept)
                 :Add (conj cs (assoc c :actor (second kept)))
                 :Skip cs
-                :Refuse (do (stop-all cs) (reduced [:failed (:id spec) (second kept)])))))
+                :Refuse (do (report! :start-error (second kept) c)
+                            (stop-all cs)
+                            (reduced [:failed (:id spec) (second kept)])))))
           [] specs))
 
 (defn- child-call
@@ -270,7 +324,8 @@
 
       :else [:noreply st]))
   (handle-timeout [_ st] [:noreply st])
-  (terminate [_ _ st] (stop-all (:children st))))
+  (terminate [_ _ st]
+    (if (simple? flags) (shutdown-together (:children st)) (stop-all (:children st)))))
 
 (defn- start*
   "Check the flags and specs, then start the supervisor; a bad one is an

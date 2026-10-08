@@ -24,6 +24,8 @@
   [:reply from value] action or with reply!."
   (:require [ensemble.actor :as act :refer [receive]]
             [ensemble.gen-server :as gs]
+            [ensemble.logger :as logger]
+            [ensemble.signal :as sig]
             [ensemble.statem :as sm]
             [ensemble.timer :as timer]))
 
@@ -46,27 +48,41 @@
                   (get deadlines k)
                   [(+ (now) (first v)) (second v)])])))
 
-(defn- finish [m reason st]
-  (terminate m reason (:state st) (:data st))
-  (act/exit! reason))
+(defn- finish
+  "Run terminate with reason and exit with it, reporting an abnormal stop
+  after event, [type content]."
+  [m reason st event]
+  (let [reason (try (terminate m reason (:state st) (:data st)) reason
+                    (catch Throwable e (act/reason-of e)))]
+    (when-not (sig/shutdown? reason)
+      (let [[type content] event]
+        (logger/report! {:level :error :kind :gen-statem-terminate :server (act/self)
+                         :name (act/registered-name (act/self))
+                         :last-event [(if (vector? type) (first type) type) content]
+                         :state (:state st) :data (:data st) :reason reason})))
+    (act/exit! reason)))
 
 (defn- next-event-of
   "Wait for the next external event, or the earliest timer.  Returns
-  [event st]; a timer that fires is removed."
-  [parent st]
+  [event st]; a timer that fires is removed.  With idle ms and no timer
+  due sooner, [[:idle] st] when that long passes with no event."
+  [parent st idle]
   (let [[k [deadline content]] (first (sort-by (comp first val) (:deadlines st)))
-        wait (when k (max 0 (- deadline (now))))
+        timer-wait (when k (max 0 (- deadline (now))))
+        idle? (and idle (or (nil? timer-wait) (< idle timer-wait)))
+        wait (if idle? idle timer-wait)
         m (receive
            [[::gs/call from request] [:event [[:call from] request]]]
            [[::gs/cast request] [:event [:cast request]]]
            [[::gs/stop reason] [:stop reason]]
            [[:EXIT from reason] :when (and (some? parent) (= from parent)) [:stop reason]]
            [[::wake] [:wake]]
-           [:after wait [:timer k content]]
+           [:after wait (if idle? [:idle] [:timer k content])]
            [msg [:event [:info msg]]])]
     (case (first m)
       ;; the timer that woke a hibernating machine for its next timeout
-      :wake (recur parent st)
+      :wake (recur parent st idle)
+      :idle [m st]
       :stop [m st]
       :event [m st]
       :timer (let [[_ k content] m
@@ -84,11 +100,11 @@
                  (catch Throwable e [::crash (act/reason-of e)]))
         r (if (and (vector? ret) (= ::crash (first ret))) ret (sm/result-of kind ret (:state st) (:data st)))]
     (case (first r)
-      ::crash (finish m (second r) st)
-      :Bad (finish m (second r) st)
+      ::crash (finish m (second r) st event)
+      :Bad (finish m (second r) st event)
       :Stop (let [[_ reason replies data] r]
               (doseq [[from v] (map rest replies)] (reply! from v))
-              (finish m reason (assoc st :data data)))
+              (finish m reason (assoc st :data data) event))
       :Transition
       (let [[_ state data actions] r
             [_ postpone? inserted replies timeouts] (sm/actions-of actions)
@@ -123,9 +139,10 @@
     (if-let [event (first (:queue st))]
       (recur (transition! m opts (update st :queue (comp vec rest)) event :event))
       (let [_ (when (:hibernate st) (hibernate! m opts parent st))
-            [msg st] (next-event-of parent st)]
-        (if (= :stop (first msg))
-          (finish m (second msg) st)
+            [msg st] (next-event-of parent st (:hibernate-after opts))]
+        (case (first msg)
+          :stop (finish m (second msg) st msg)
+          :idle (hibernate! m opts parent st)
           (recur (transition! m opts st (second msg) :event)))))))
 
 (defn- run [m opts parent ack]
@@ -149,22 +166,18 @@
         (let [st (if (:state-enter opts) (transition! m opts st [:enter state] :enter) st)]
           (run-loop m opts parent st))))))
 
-(defn- start* [m {:keys [name trap] :as opts} link?]
+(defn- start* [m {:keys [name trap timeout] :as opts} link?]
   (let [ack (promise)
         parent (when link? (act/self))
-        a (act/spawn (fn [] (run m opts parent ack)) {:name name :link link? :trap trap})
-        hook (act/on-exit! a (fn [reason] (deliver ack [:error reason])))
-        r @ack]
-    (act/cancel-exit! a hook)
-    (case (first r)
-      :ok a
-      :ignore :ignore
-      (throw (ex-info (str "gen-statem init failed: " (pr-str (second r))) {:reason (second r)})))))
+        a (act/spawn (fn [] (run m opts parent ack)) {:name name :link link? :trap trap})]
+    (gs/await-init a ack timeout "gen-statem")))
 
 (defn start
   "Start machine m, returning once init has returned.  Options: :name,
-  :trap (trap exits, so a supervisor's shutdown runs terminate), and
-  :state-enter (make enter calls)."
+  :trap (trap exits, so a supervisor's shutdown runs terminate),
+  :state-enter (make enter calls), :timeout (ms init may take, default
+  :infinity; a slower init is killed and start throws {:reason :timeout})
+  and :hibernate-after (hibernate after that many ms with no event)."
   ([m] (start m {}))
   ([m opts] (start* m opts false)))
 

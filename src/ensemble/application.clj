@@ -27,6 +27,10 @@
 
 (defonce ^:private exit-log (atom []))
 
+(defonce ^:private started-order
+  ;; the names of the running applications, in the order they started
+  (atom []))
+
 (defn load!
   "Register an application spec.  Returns its name."
   [spec]
@@ -48,6 +52,7 @@
         [[:DOWN ref :process _ reason]
          (when (get @running name)
            (swap! running dissoc name)
+           (swap! started-order (fn [o] (filterv #(not= name %) o)))
            (swap! exit-log conj [name reason])
            (when (or (= :permanent kind)
                      (and (= :transient kind) (not (sig/shutdown? reason))))
@@ -60,12 +65,17 @@
   or its :start throws.  Returns :ok."
   [name]
   (let [spec (or (get @loaded name) (fail [:not-loaded name]))]
-    (when (contains? @running name) (fail [:already-started name]))
     (doseq [dep (:applications spec)]
       (when-not (contains? @running dep) (fail [:not-started dep])))
-    (let [r ((:start spec))
+    ;; claim the name first, so two starts of one application cannot both run
+    (let [[before _] (swap-vals! running (fn [r] (if (contains? r name) r (assoc r name ::starting))))]
+      (when (contains? before name) (fail [:already-started name])))
+    (let [r (try ((:start spec)) (catch Throwable e (swap! running dissoc name) (throw e)))
           [top state] (if (vector? r) r [r nil])]
-      (when-not (act/actor? top) (fail [:bad-return r]))
+      (when-not (act/actor? top)
+        (swap! running dissoc name)
+        (fail [:bad-return r]))
+      (swap! started-order (fn [o] (conj (filterv #(not= name %) o) name)))
       (swap! running assoc name {:spec spec :top top :state state
                                  :master (master name top (:type spec :temporary))})
       :ok)))
@@ -91,21 +101,25 @@
   "Stop the running application name: stop its tree, then run :stop on its
   state.  Returns :ok, or nil if it is not running."
   [name]
-  (when-let [{:keys [spec top state master]} (get @running name)]
+  (when-let [{:keys [spec top state master]} (let [a (get @running name)] (when (map? a) a))]
     (swap! running dissoc name)
+    (swap! started-order (fn [o] (filterv #(not= name %) o)))
     (act/! master ::stop)
     (when (act/alive? top)
       (try (gs/stop! top :shutdown) (catch Throwable _ (act/exit! top :kill))))
     (when-let [stop (:stop spec)] (stop state))
     :ok))
 
-(defn- stop-all! []
-  (doseq [n (keys @running)] (stop! n)))
+(defn- stop-all!
+  "Stop every running application, the last started first, as OTP stops
+  them with the node: an application stops before those it depends on."
+  []
+  (doseq [n (rseq @started-order)] (stop! n)))
 
 (defn which-applications
-  "The names of the running applications."
+  "The names of the running applications, in the order they started."
   []
-  (vec (keys @running)))
+  @started-order)
 
 (defn started?
   "True while name is running."

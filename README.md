@@ -136,7 +136,10 @@ such as a test or the REPL.
   synchronous: they return the server once `init` has, return `:ignore` for
   `:ignore`, and throw `{:reason r}` for a stop, an error, a throw or a bad
   return. The process then exits (`:normal` for `:error` and `:ignore`), and
-  a failed `start-link` does not take its caller down.
+  a failed `start-link` does not take its caller down. The `:timeout`
+  option is how long `init` may take (default `:infinity`): a slower one
+  is killed and the start throws `{:reason :timeout}`, as OTP's
+  `{timeout, T}`.
 - The callbacks return OTP's shapes: `[:reply r st]`, `[:noreply st]`,
   `[:stop reason st]`, `[:stop reason reply st]`, each optionally with an
   action: a timeout (ms or `:infinity`), `:hibernate`, or `[:continue c]`,
@@ -155,8 +158,9 @@ such as a test or the REPL.
   from anywhere.
 - A `:hibernate` action hibernates the server until its next message, and
   the `:hibernate-after` start option does the same after that many ms
-  without one. In gen_statem, `:hibernate` is a transition action, and a
-  hibernating machine still gets its timeouts.
+  without one. In gen_statem, `:hibernate` is a transition action,
+  `:hibernate-after` is a start option there too, and a hibernating
+  machine still gets its timeouts.
 
 ## gen_statem
 
@@ -237,7 +241,8 @@ there is none), and `delete-handler!` returns what `h-terminate` returned.
   `(start-child! sup args)` starts a child from it with `args` appended to
   its start fn's arguments. These children have no ids: they are
   terminated by pid, cannot be restarted or deleted by id, and are
-  restarted alone.
+  restarted alone. When the supervisor stops, they are all sent
+  `:shutdown` at once and waited for under one shutdown time.
 - A child may be `:significant`. With `:auto-shutdown :any-significant`
   the supervisor shuts down when any significant child ends without being
   restarted. With `:all-significant` it shuts down when the last one ends.
@@ -256,7 +261,20 @@ dependencies to be running, `ensure-all-started!` starts them first, and
 If the tree exits on its own, the type decides what happens next. A
 `:temporary` application is only recorded (see `exits`). A `:permanent` one,
 or a `:transient` one that exited abnormally, stops every other application,
-where OTP would stop the node.
+the last started first, where OTP would stop the node.
+
+## Reports
+
+`ensemble.logger` gets what OTP's logger gets from the runtime: a crash
+report when an actor's body throws something it didn't catch, a report when
+a gen-server or gen-statem stops abnormally (with its last message or
+event, and its state), and supervisor reports (`:child-terminated`,
+`:start-error`, `:shutdown-error`, and `:shutdown` when it reaches its
+restart intensity). An orderly end is never reported, nor is an actor's
+own `(exit! reason)`. Reports print to `*err*` until `set-handler!`
+installs another handler.
+
+## Timers
 
 ## Timers
 

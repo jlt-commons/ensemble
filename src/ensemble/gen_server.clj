@@ -2,7 +2,8 @@
   "The OTP gen_server behaviour.  A server is a record implementing Server;
   start or start-link runs it as an actor, and clients use call! and cast!.
 
-  Starting is synchronous, as in OTP: start returns once init has returned.
+  Starting is synchronous, as in OTP: start returns once init has returned,
+  or fails with :timeout if init takes longer than the :timeout option.
   init returns [:ok state] or [:ok state action]; [:stop reason] and
   [:error reason] make start throw {:reason reason}, and :ignore makes it
   return :ignore.  A throw from init is [:stop the-throwable].  The server
@@ -30,7 +31,9 @@
   :reason (:noproc, :timeout, :calling-self, or the server's exit reason)."
   (:require [ensemble.actor :as act :refer [receive]]
             [ensemble.callback :as cb]
-            [ensemble.request :as rq]))
+            [ensemble.logger :as logger]
+            [ensemble.request :as rq]
+            [ensemble.signal :as sig]))
 
 (defprotocol Server
   (init [this] "Return [:ok state], [:ok state action], [:stop reason], [:error reason] or :ignore.")
@@ -196,12 +199,30 @@
   (try (act/! srv [::cast request]) (catch Throwable _ nil))
   :ok)
 
+(defn- last-message
+  "The message a server was handling as it stopped, as a report shows it."
+  [m]
+  (case (first m)
+    :call [:call (nth m 2)]
+    m))
+
+(defn- report-terminate!
+  "Report a server stopping with reason after m, unless the stop is orderly."
+  [reason m state]
+  (when-not (sig/shutdown? reason)
+    (logger/report! {:level :error :kind :gen-server-terminate :server (act/self)
+                     :name (act/registered-name (act/self)) :last-message (last-message m)
+                     :state state :reason reason})))
+
 (defn- finish
-  "Run terminate with reason and exit with it.  A terminate that throws makes
-  its throwable the exit reason instead."
-  [server reason state]
-  (terminate server reason state)
-  (act/exit! reason))
+  "Run terminate with reason and exit with it, reporting an abnormal stop
+  after message m.  A terminate that throws makes its throwable the exit
+  reason instead."
+  [server reason state m]
+  (let [reason (try (terminate server reason state) reason
+                    (catch Throwable e (act/reason-of e)))]
+    (report-terminate! reason m state)
+    (act/exit! reason)))
 
 (defn- crash-reason [e] (act/reason-of e))
 
@@ -249,8 +270,8 @@
         :idle   (if (:disk? idle)
                   (act/passivate! run-loop server parent st [:Wait nil] idle)
                   (act/hibernate! run-loop server parent st [:Wait nil] idle))
-        :stop   (finish server (second m) st)
-        :parent (finish server (second m) st)
+        :stop   (finish server (second m) st m)
+        :parent (finish server (second m) st [:EXIT parent (second m)])
         (let [step (dispatch server st m)]
           (case (first step)
             :Reply   (do (reply! (second m) (nth step 1))
@@ -258,13 +279,11 @@
             :NoReply (recur (nth step 1) (nth step 2))
             :Stop    (let [[_ reason reply? reply st*] step]
                        (when reply? (reply! (second m) reply))
-                       (finish server reason st*))
-            :Bad     (finish server [:bad-return-value (nth step 1)] st)
-            :Crash   (let [reason (nth step 1)]
-                       (terminate server reason st)
-                       (act/exit! reason))))))))
+                       (finish server reason st* m))
+            :Bad     (finish server [:bad-return-value (nth step 1)] st m)
+            :Crash   (finish server (nth step 1) st m)))))))
 
-(defn- run [server parent ack timeout idle]
+(defn- run [server parent ack idle]
   (let [r (try (cb/interpret-init (init server))
                (catch Throwable e (let [why (act/reason-of e)] [:Fail why why])))
         quit! (fn [answer exit]
@@ -274,17 +293,38 @@
     (case (first r)
       :Start  (let [[_ st next] r]
                 (deliver ack [:ok])
-                ;; a :timeout start option arms a timeout when init set none
-                (run-loop server parent st (if (and timeout (= [:Wait nil] next)) [:Wait timeout] next)
-                          idle))
+                (run-loop server parent st next idle))
       :Ignore (quit! [:ignore] :normal)
       :Fail   (let [[_ why exit] r] (quit! [:error why] exit)))))
+
+(defn await-init
+  "What a behaviour's start answers once its process srv has run init, which
+  delivers [:ok], [:ignore] or [:error reason] to ack: srv, :ignore, or a
+  throw of {:reason reason}.  With timeout ms (nil or :infinity: none), an
+  init still running then is killed -- unlinked first, so a linked starter
+  is not taken down -- and the start fails with :timeout, as OTP's
+  {timeout, T} start option.  what names the behaviour in the message."
+  [srv ack timeout what]
+  (let [hook (act/on-exit! srv (fn [reason] (deliver ack [:error reason])))
+        t (when-not (= :infinity timeout) timeout)
+        r (if t (deref ack t [:timeout]) @ack)]
+    (act/cancel-exit! srv hook)
+    (case (first r)
+      :ok srv
+      :ignore :ignore
+      :timeout (do (when (act/self) (act/unlink! srv))
+                   (act/exit! srv :kill)
+                   (act/exit-reason srv)
+                   (throw (ex-info (str what " init timed out") {:reason :timeout})))
+      (throw (ex-info (str what " init failed: " (pr-str (second r)))
+                      {:reason (second r)}
+                      (when (instance? Throwable (second r)) (second r)))))))
 
 (defn- start* [server {:keys [name timeout trap hibernate-after passivate-after]} link?]
   (let [ack (promise)
         parent (when link? (act/self))
         srv (try
-              (act/spawn (fn [] (run server parent ack timeout
+              (act/spawn (fn [] (run server parent ack
                                      (cond passivate-after {:after passivate-after :disk? true}
                                            hibernate-after {:after hibernate-after :disk? false})))
                          {:name name :link link? :trap trap})
@@ -292,16 +332,8 @@
                 (if-let [holder (and name (act/whereis name))]
                   (throw (ex-info "gen-server already started"
                                   {:reason [:already-started holder]}))
-                  (throw e))))
-        hook (act/on-exit! srv (fn [reason] (deliver ack [:error reason])))
-        r @ack]
-    (act/cancel-exit! srv hook)
-    (case (first r)
-      :ok srv
-      :ignore :ignore
-      (throw (ex-info (str "gen-server init failed: " (pr-str (second r)))
-                      {:reason (second r)}
-                      (when (instance? Throwable (second r)) (second r)))))))
+                  (throw e))))]
+    (await-init srv ack timeout "gen-server")))
 
 (defn start
   "Start server as a new actor, returning it once init has returned, or
@@ -310,7 +342,8 @@
   Options:
 
       :name     register the server under this name
-      :timeout  a timeout armed before the first message, as a callback's
+      :timeout  ms init may take (default :infinity); a slower init is
+                killed and start throws {:reason :timeout}, as OTP's
       :trap     trap exits from the start (a server that must terminate
                 cleanly when its parent stops it traps exits)
       :hibernate-after  hibernate after this many ms with no message, as

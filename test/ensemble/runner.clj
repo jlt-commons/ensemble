@@ -12,6 +12,7 @@
   Namespaces given as arguments narrow the run to those."
   (:require [clojure.test :as t]
             [clojure.string :as str]
+            [ensemble.logger :as logger]
             [jolt.fs :as fs]))
 
 (defn- path->ns
@@ -46,6 +47,8 @@
 (defn -main
   "Run every spec and test, or only the namespaces named in args."
   [& args]
+  ;; the tests crash actors on purpose: their reports would bury the results
+  (logger/set-handler! (fn [_] nil))
   (let [only (when (seq args) (set (map symbol args)))
         pick (fn [nses] (if only (filterv only nses) nses))
         specs (pick (discovered "*_spec.clj"))
