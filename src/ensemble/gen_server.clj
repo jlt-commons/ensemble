@@ -139,13 +139,17 @@
 (defn handle-system
   "Answer the system request req from from, in a behaviour whose state as
   sys sees it is st and whose status (status dbg) describes.  Returns [dbg
-  st]: what the process keeps from now on."
-  [dbg req from st status]
+  st]: what the process keeps from now on.  A state replace-state makes
+  that valid? refuses is an error, and the state is left."
+  ([dbg req from st status] (handle-system dbg req from st status any?))
+  ([dbg req from st status valid?]
   (let [answer (fn [v] (reply! from v))
         [tag arg] (if (vector? req) req [req])]
     (case tag
       :get-state (do (answer [:ok st]) [dbg st])
-      :replace-state (let [r (try [:ok (arg st)] (catch Throwable e [:error e]))]
+      :replace-state (let [r (try (let [new (arg st)]
+                                    (if (valid? new) [:ok new] [:error [:bad-state new]]))
+                                  (catch Throwable e [:error e]))]
                        (answer r)
                        [dbg (if (= :ok (first r)) (second r) st)])
       :get-status (do (answer [:ok (status dbg)]) [dbg st])
@@ -160,7 +164,7 @@
                                        (assoc s :current-time (System/currentTimeMillis))
                                        :no-statistics)])
                         [dbg st]))
-      (do (answer [:error [:unknown-system-msg req]]) [dbg st]))))
+      (do (answer [:error [:unknown-system-msg req]]) [dbg st])))))
 
 (defn observed
   "dbg once the process has taken event, an ordinary message: counted, and
@@ -450,10 +454,21 @@
     (case (first r)
       :ok srv
       :ignore :ignore
-      :timeout (do (when (act/self) (act/unlink! srv))
+      :timeout (do (when (act/self)
+                     (act/unlink! srv)
+                     ;; an init that died as the wait ran out may have sent its
+                     ;; exit already: a trapping starter does not keep it
+                     (when (act/process-info (act/self) :trap-exit)
+                       (receive [[:EXIT srv _] nil] [:after 0 nil])))
                    (act/exit! srv :kill)
                    (act/exit-reason srv)
-                   (throw (ex-info (str what " init timed out") {:reason :timeout})))
+                   ;; and the start fails with what it died of, not :timeout
+                   (let [late (deref ack 0 nil)]
+                     (if (= :error (first late))
+                       (throw (ex-info (str what " init failed: " (pr-str (second late)))
+                                       {:reason (second late)}
+                                       (when (instance? Throwable (second late)) (second late))))
+                       (throw (ex-info (str what " init timed out") {:reason :timeout})))))
       (throw (ex-info (str what " init failed: " (pr-str (second r)))
                       {:reason (second r)}
                       (when (instance? Throwable (second r)) (second r)))))))

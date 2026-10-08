@@ -72,7 +72,9 @@
 (defn remote?
   "True when x is a handle on a process of another node."
   [x]
-  (and (record? x) (proc/process? x)))
+  ;; implementing Process itself: every map satisfies it, local actors
+  ;; being maps
+  (and (record? x) (instance? ensemble.process.Process x)))
 
 (defn pid?
   "True when x is a process handle, local or remote (Erlang's is_pid)."
@@ -947,6 +949,33 @@
   [_ _]
   true)
 
+;; a map pattern looks a key up in the message, and a sorted map whose keys
+;; cannot be compared with it throws there: such a clause does not match,
+;; and the actor is not crashed by what someone sent it
+
+(defn- clause-of
+  "select/clause-of, a clause whose match throws ClassCastException
+  counting as one that does not match."
+  [pats ok? msg]
+  (try (select/clause-of pats ok? msg)
+       (catch ClassCastException _
+         (or (some (fn [k]
+                     (let [r (try (select/clause-of [(nth pats k)] (fn [_ env] (ok? k env)) msg)
+                                  (catch ClassCastException _ [:Miss]))]
+                       (when (= :Hit (first r)) [:Hit k (nth r 2)])))
+                   (range (count pats)))
+             [:Miss]))))
+
+(defn- scan-each
+  "select/scan, through clause-of: for a mailbox where it threw."
+  [msgs pats ok? start]
+  (let [n (count msgs)]
+    (loop [i start]
+      (if (< i n)
+        (let [r (clause-of pats ok? (nth msgs i))]
+          (if (= :Hit (first r)) (let [[_ k env] r] [:Take i k env]) (recur (inc i))))
+        [:None i]))))
+
 (defn- take-new!
   "Take messages off me's queue, oldest first, until one satisfies a clause:
   [clause-index msg env] for it, or nil once the queue is empty.  Each one
@@ -962,7 +991,7 @@
             (if (signal? m)
               ::signal
               (do (swap! inbox pop)
-                  (let [r (select/clause-of pats ok? m)]
+                  (let [r (clause-of pats ok? m)]
                     (if (= :Hit (first r))
                       (let [[_ k env] r] [k m env])
                       (do (swap! (::saved me) conj m)
@@ -987,7 +1016,8 @@
      (loop [start 0]
        (drain-signals! me)
        (let [saved @(::saved me)
-             r (select/scan saved pats ok? start)]
+             r (try (select/scan saved pats ok? start)
+                    (catch ClassCastException _ (scan-each saved pats ok? start)))]
          (if (= :Take (first r))
            (let [[_ i k env] r]
              ;; an emptied subvec is let go, not kept to grow on
@@ -1092,23 +1122,25 @@
 
 (defn join
   "Block until actor exits.  Return its body's value on a :normal exit;
-  otherwise rethrow what it died by.  With timeout-ms, throw if it is still
-  running then.  Not an Erlang operation: it is for code outside the actor
-  world, a test or a REPL, to wait on one."
+  otherwise rethrow what it died by.  With ms (nil or :infinity: none),
+  throw if it is still running then.  Not an Erlang operation: it is for
+  code outside the actor world, a test or a REPL, to wait on one."
   ([actor] (outcome @(::done actor)))
-  ([actor timeout-ms]
-   (let [r (deref (::done actor) timeout-ms ::timeout)]
+  ([actor ms]
+   (let [t (timeout-ms ms)
+         r (if t (deref (::done actor) t ::timeout) @(::done actor))]
      (if (= ::timeout r)
-       (throw (ex-info "join timed out" {:timeout-ms timeout-ms}))
+       (throw (ex-info "join timed out" {:timeout-ms ms}))
        (outcome r)))))
 
 (defn exit-reason
   "Block until actor exits and return its exit reason: :normal, the reason it
-  exited with, or the throwable it died by.  With timeout-ms, nil if it is
-  still running then."
+  exited with, or the throwable it died by.  With ms (nil or :infinity:
+  none), nil if it is still running then."
   ([actor] (let [[tag _ reason] @(::done actor)] (if (= :ok tag) :normal reason)))
-  ([actor timeout-ms]
-   (let [r (deref (::done actor) timeout-ms ::timeout)]
+  ([actor ms]
+   (let [t (timeout-ms ms)
+         r (if t (deref (::done actor) t ::timeout) @(::done actor))]
      (when-not (= ::timeout r)
        (let [[tag _ reason] r] (if (= :ok tag) :normal reason))))))
 

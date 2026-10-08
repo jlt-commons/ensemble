@@ -449,3 +449,21 @@
                          (act/! al :second)
                          [(receive [m m] [:after 50 nil]) (receive [m m] [:after 50 nil])])))]
     (is (= [:first nil] (act/join a 1000)))))
+
+(defrecord JustData [x])
+
+(deftest a-record-is-not-a-pid
+  (is (not (act/pid? (->JustData 1))))
+  (is (not (act/remote? (->JustData 1))))
+  (is (not (act/pid? {:a 1}))))
+
+(deftest join-and-exit-reason-take-infinity
+  (let [a (act/spawn (fn [] :done))]
+    (is (= :done (act/join a :infinity)))
+    (is (= :normal (act/exit-reason a :infinity)))
+    (is (= :normal (act/exit-reason a nil)))))
+
+(deftest a-map-pattern-passes-over-a-sorted-map-of-other-keys
+  (let [a (act/spawn (fn [] (receive [{:k v} [:matched v]] [m [:other m]])))]
+    (act/! a (sorted-map 1 :a))
+    (is (= [:other {1 :a}] (act/join a 1000)) "the actor is not crashed by the sorted map's compare")))

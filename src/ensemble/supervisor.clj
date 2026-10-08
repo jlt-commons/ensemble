@@ -121,31 +121,39 @@
   "Stop the running children all at once, as OTP stops a
   :simple-one-for-one supervisor's: each is unlinked and sent :shutdown
   (killed, for :brutal-kill), then all are waited for under one shutdown
-  time, and those still running then are killed.  Returns the children
-  with no actor."
+  time, and those still running then are killed.  A child that ends other
+  than as it was told is a shutdown_error, as in shutdown-child.  Returns
+  the children with no actor."
   [children]
   (let [running (filterv :actor children)
         how (:shutdown (first running))
+        expected (if (= :brutal-kill how) :killed :shutdown)
         watched (into {} (for [c running
                                :let [a (:actor c)
                                      mref (act/monitor! a)]]
                            (do (act/unlink! a)
                                (receive [[:EXIT a _] nil] [:after 0 nil])
                                (act/exit! a (if (= :brutal-kill how) :kill :shutdown))
-                               [mref a])))
+                               [mref c])))
         deadline (when (int? how) (+ (act/now-ms) how))
         await (fn [left t]
                 (receive
-                 [[:DOWN mref :process _ _] :when (contains? left mref) mref]
-                 [:after t ::late]))]
-    (loop [left watched]
-      (when (seq left)
-        (let [r (await left (when deadline (max 0 (- deadline (act/now-ms)))))]
-          (if (= ::late r)
-            (do (run! (fn [a] (act/exit! a :kill)) (vals left))
-                (loop [left left]
-                  (when (seq left) (recur (dissoc left (await left nil))))))
-            (recur (dissoc left r))))))
+                 [[:DOWN mref :process _ why] :when (contains? left mref) [mref why]]
+                 [:after t ::late]))
+        ended (loop [left watched, ended {}]
+                (if (empty? left)
+                  ended
+                  (let [r (await left (when deadline (max 0 (- deadline (act/now-ms)))))]
+                    (if (= ::late r)
+                      (do (run! (fn [c] (act/exit! (:actor c) :kill)) (vals left))
+                          (loop [left left, ended ended]
+                            (if (empty? left)
+                              ended
+                              (let [[mref why] (await left nil)]
+                                (recur (dissoc left mref) (assoc ended mref why))))))
+                      (let [[mref why] r] (recur (dissoc left mref) (assoc ended mref why)))))))]
+    (doseq [[mref why] ended :when (not (contains? #{expected :noproc} why))]
+      (report! :shutdown-error why (get watched mref)))
     (mapv #(assoc % :actor nil) children)))
 
 (defn- stop-all [children]

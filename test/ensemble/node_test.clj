@@ -6,7 +6,8 @@
             [ensemble.actor :as act :refer [receive]]
             [ensemble.gen-server :as gs]
             [ensemble.node :as node]
-            [ensemble.sys :as sys]))
+            [ensemble.sys :as sys]
+            [ensemble.transport :as tr]))
 
 (defn- sleep [ms] (a/<!! (a/timeout ms)))
 
@@ -256,3 +257,83 @@
 (deftest refs-carry-their-nodes-creation
   (let [a (fresh-node)]
     (is (= (node/creation a) (:ensemble.actor/creation (node/with-node a (act/make-ref)))))))
+
+;; --- the envelope: protocol fields apart from the data ---------------------------
+
+(defrecord NotWire [x])
+
+(deftest data-shaped-like-the-wire-format-arrives-as-sent
+  (let [[a b] (two-nodes)
+        e (node/with-node a (node/spawn-on b `echo []))]
+    (doseq [v [[:Pid b 1 2] [:Local 5] [:ensemble.node/pid :x 1 2] [:ensemble.node/q 1]
+               {:ensemble.node/exception "x"} '(:Pid :x 1 2) #{[:Local 1]}]]
+      (is (= [:echo v] (ask a e v)) (pr-str v)))))
+
+(deftest a-throwable-crosses-as-an-ex-info
+  (let [[a b] (two-nodes)
+        e (node/with-node a (node/spawn-on b `echo []))
+        [_ ex] (ask a e (ex-info "boom" {:k 1}))]
+    (is (= "boom" (ex-message ex)))
+    (is (= {:k 1} (ex-data ex)))))
+
+(deftest data-the-wire-cannot-carry-fails-at-the-sender
+  (let [[a b] (two-nodes)
+        e (node/with-node a (node/spawn-on b `echo []))]
+    (is (thrown? Throwable (node/with-node a (act/! e [:me (->NotWire 1)]))))
+    (is (thrown? Throwable (node/with-node a (act/! e [:me (atom 1)]))))
+    (is (= [:echo :still-up] (ask a e :still-up)) "the connection is unharmed")))
+
+(deftest a-malformed-frame-drops-the-connection
+  (let [[a b] (two-nodes)
+        conn (get-in @@#'node/nodes [b :conns a :conn])]
+    (#'node/write-frame! b conn [:not-an-op])
+    (is (eventually #(= [] (node/with-node a (node/connected)))) "the receiver drops the peer")
+    (is (eventually #(= [] (node/with-node b (node/connected)))) "and the peer sees it go")))
+
+(deftest a-bad-spawn-is-refused-and-the-connection-survives
+  (let [[a b] (two-nodes)]
+    (is (= [:not-allowed 'echo]
+           (try (node/with-node a (node/spawn-on b 'echo [])) (catch Throwable e (:reason (ex-data e))))))
+    (is (= [:undefined `no-such-fn]
+           (try (node/with-node a (node/spawn-on b `no-such-fn [] {:timeout 2000}))
+                (catch Throwable e (:reason (ex-data e))))))
+    (let [e (node/with-node a (node/spawn-on b `echo []))]
+      (is (= [:echo :ok] (ask a e :ok))))))
+
+(deftest monitors-a-peer-held-go-with-it
+  (let [[a b] (two-nodes)
+        target (node/with-node b (act/spawn idle))]
+    ;; as a sees it: a process of b, so the monitor crosses
+    (let [remote (node/->RemotePid b (:ensemble.actor/pid target) (node/creation b))]
+      (node/with-node a (act/spawn (fn [] (act/monitor! remote) (receive [:never nil])))))
+    (is (eventually #(seq @(:ensemble.actor/monitors target))))
+    (node/with-node a (node/disconnect! b))
+    (is (eventually #(empty? @(:ensemble.actor/monitors target)))
+        "the monitor the lost peer asked for is dropped")))
+
+(deftest a-restarted-peer-is-taken-in-place-of-its-old-run
+  (let [[a b] (two-nodes)
+        seen (atom [])
+        w (node/with-node a (act/spawn (fn [] (node/monitor-nodes! true)
+                                         (loop [] (receive [m (do (swap! seen conj m) (recur))])))))]
+    (sleep 20)
+    ;; b starts again without its old connection closing
+    (node/start! b (node/loopback) {:spawn #{'ensemble.node-test}})
+    (is (true? (node/with-node b (node/connect! a))) "the new run connects")
+    (is (eventually #(= [[:nodedown b] [:nodeup b]] @seen)) "the old run goes down first")
+    (act/exit! w :kill)))
+
+(deftest an-oversized-frame-drops-the-connection
+  (let [a (fresh-node {:max-frame 1000})
+        b (fresh-node)
+        _ (node/with-node b (node/connect! a))
+        e (node/with-node b (node/spawn-on a `echo []))]
+    (node/with-node b (act/! e [:x (apply str (repeat 5000 "x"))]))
+    (is (eventually #(= [] (node/with-node a (node/connected)))))))
+
+(deftest a-connection-that-never-shakes-hands-is-closed
+  (let [a (fresh-node {:handshake-timeout 100})
+        closed (promise)
+        c (tr/-connect (node/loopback) :someone a)]
+    (tr/-start c (fn [_] nil) (fn [] (deliver closed true)))
+    (is (true? (deref closed 2000 false)))))

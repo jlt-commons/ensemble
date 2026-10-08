@@ -6,7 +6,7 @@
   A failed call throws ex-info whose :reason is :noconnection (the node
   cannot be reached, or went down during the call), :timeout (the
   process running it is then killed), [:not-allowed sym], [:exception e]
-  for a throw (e as data: {:ensemble.node/exception message ...}), or
+  for a throw (e an ex-info with the message and data it was thrown with), or
   [:exit reason] for an exit."
   (:require [ensemble.actor :as act :refer [receive]]
             [ensemble.node :as node]))
@@ -26,16 +26,16 @@
 
 (defn- start
   "Start (apply f args) on node n, answering to the current actor under
-  ref; its pid."
-  [n f-sym args ref]
+  ref, waiting up to timeout-ms for n to start it; its pid."
+  [n f-sym args ref timeout-ms]
   (if (= n (act/node))
     (let [me (act/self)
           f (requiring-resolve f-sym)]
       (act/spawn (fn [] (act/! me [::node/result ref (node/outcome #(apply f args))]))))
-    (try (node/spawn-on n f-sym args {:reply ref})
+    (try (node/spawn-on n f-sym args {:reply ref :timeout timeout-ms})
          (catch Throwable e
            (let [r (:reason (ex-data e))]
-             (fail (if (= :timeout r) :noconnection r)))))))
+             (fail r))))))
 
 (defn call
   "(apply f args) on node n, f named by f-sym, and its value, waiting up to
@@ -45,7 +45,7 @@
    (in-actor
     (fn []
       (let [ref (act/make-ref)
-            pid (start n f-sym args ref)
+            pid (start n f-sym args ref timeout-ms)
             mref (act/monitor! pid)
             r (receive
                [[::node/result ref r] r]

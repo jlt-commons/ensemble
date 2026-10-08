@@ -168,11 +168,14 @@
 (defn- hibernate!
   "Hibernate before waiting for the next event: the stack goes, and the
   next message -- or a timer set to the earliest timeout, which a
-  hibernating machine must still see -- runs the loop again."
+  hibernating machine must still see -- runs the loop again.  The wake
+  timer of an earlier hibernation is cancelled, so idle cycles do not pile
+  them up."
   [m opts parent st]
-  (when-let [deadline (first (sort (map first (vals (:deadlines st)))))]
-    (timer/send-after (max 0 (- deadline (now))) (act/self) [::wake]))
-  (act/hibernate! run-loop m opts parent (dissoc st :hibernate)))
+  (when-let [t (:wake-timer st)] (timer/cancel-timer t {:async true :info false}))
+  (let [wake (when-let [deadline (first (sort (map first (vals (:deadlines st)))))]
+               (timer/send-after (max 0 (- deadline (now))) (act/self) [::wake]))]
+    (act/hibernate! run-loop m opts parent (-> st (dissoc :hibernate) (assoc :wake-timer wake)))))
 
 (defn- status-of
   "What sys/get-status shows of a machine."
@@ -186,7 +189,8 @@
   "Answer a system message; sys sees the machine's state as [state data]."
   [m parent st from req]
   (let [[dbg [state data]] (gs/handle-system (:dbg st) req from [(:state st) (:data st)]
-                                             #(status-of m parent st %))]
+                                             #(status-of m parent st %)
+                                             #(and (vector? %) (= 2 (count %))))]
     (assoc st :dbg dbg :state state :data data)))
 
 (defn- run-loop [m opts parent st]

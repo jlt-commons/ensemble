@@ -14,7 +14,10 @@
 
   An orderly end -- :normal, :shutdown or [:shutdown term] -- is never
   reported, nor is an actor's own (exit! reason): only a throw it did not
-  catch is a crash, as the emulator reports only an uncaught error.
+  catch is a crash, as the emulator reports only an uncaught error.  An
+  exit whose reason is a throwable counts as that throw: it is how a
+  behaviour passes on a crash in its callback, which OTP reports as a
+  crash too, beside the behaviour's own report.
 
   Every report goes to one handler, a fn of the report, which prints it to
   *err* until set-handler! installs another.  A handler that throws is

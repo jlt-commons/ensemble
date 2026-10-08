@@ -1,9 +1,9 @@
 (ns ensemble.codec
   "How a frame's value becomes bytes and back.  ensemble.node hands a codec
-  plain data -- each process in it already written as [:Pid node id
-  creation], each throwable as a map -- so a codec need only carry
-  keywords, symbols, strings, numbers, booleans, nil, vectors, lists, maps
-  and sets.  EDN is the default; a library may supply a faster one."
+  plain data -- each process and throwable in it already written as tagged
+  data -- so a codec need only carry keywords, symbols, strings, numbers,
+  characters, booleans, nil, uuids, instants, vectors, lists, maps and
+  sets.  EDN is the default; a library may supply a faster one."
   (:require [clojure.edn :as edn]))
 
 (defprotocol Codec

@@ -161,3 +161,10 @@
           (is (= [:my :fn] (:initial-call r)))
           (is (= [p] (:ancestors r)))))
       (finally (log/set-handler! old)))))
+
+(deftest a-gen-statem-refuses-a-replaced-state-of-the-wrong-shape
+  (let [m (sm/start (->Toggle))]
+    (is (thrown? Throwable (sys/replace-state! m (fn [_] {:not :a-pair}))))
+    (is (thrown? Throwable (sys/replace-state! m (fn [_] nil))))
+    (is (= [:off 0] (sys/get-state m)) "the machine is unharmed")
+    (gs/stop! m)))

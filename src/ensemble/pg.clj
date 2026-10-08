@@ -103,7 +103,11 @@
                      st (assoc-in st [:watchers g ref] w)
                      st (assoc-in st [:mons (act/monitor! w)] [:watcher g ref])]
                  [:reply [ref (get (view st) g [])] st])
-      :demonitor (let [[_ g ref] req] [:reply :ok (update-in st [:watchers g] dissoc ref)])))
+      :demonitor (let [[_ g ref] req
+                       mref (some (fn [[m v]] (when (= v [:watcher g ref]) m)) (:mons st))]
+                   (when mref (act/demonitor! mref {:flush true}))
+                   [:reply :ok (cond-> (update-in st [:watchers g] dissoc ref)
+                                 mref (update :mons dissoc mref))])))
   (handle-cast [_ req st]
     (case (first req)
       :join (let [[_ peer g pids] req]

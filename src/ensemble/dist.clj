@@ -4,15 +4,15 @@
   connection does to the links and monitors that cross it.  ensemble.node
   makes every one of them through these.
 
-  A pid on the wire is [:Pid node id creation], creation the number its
-  node drew when it started, so a pid of an earlier run of a node names no
-  process of the run after it; a destination is a pid, [:Name nm] or [:At
-  nm node], Erlang's {Name, Node}.
+  A pid is [:Pid node id creation], creation the number its node drew
+  when it started, so a pid of an earlier run of a node names no process
+  of the run after it; a destination is a pid, [:Name nm] or [:At nm
+  node], Erlang's {Name, Node}.
 
   Before two nodes exchange anything else they shake hands, and the
   handshake's every decision is here too; so is how a frame's length is
   written on the wire."
-  (:require [clojure.walk :as walk]))
+  )
 
 (defn route
   "Where a send to dest goes from node self, now in its run creation:
@@ -27,16 +27,15 @@
     :Name (let [[_ nm] dest] [:Named nm])
     :At (let [[_ nm n] dest] (if (= n self) [:Named nm] [:NamedThere n nm]))))
 
-(defn- own-pid? [self creation x]
-  (and (vector? x) (= 4 (count x)) (= :Pid (first x)) (= self (second x)) (= creation (nth x 3))))
-
 (defn arrive
-  "A message as node self, in its run creation, receives it: each [:Pid
-  self id creation] inside -- in a vector, a map, a set, at any depth -- is
-  this node's own process again, [:Local id]; every other value, a pid of
-  an earlier run among them, is as it came."
-  [self creation v]
-  (walk/postwalk (fn [x] (if (own-pid? self creation x) [:Local (nth x 2)] x)) v))
+  "What a pid that arrives at node self, in its run creation, is there: a
+  pid of self's current run is its own process again, [:Local id]; any
+  other, a pid of an earlier run among them, stays as it came."
+  [self creation pid]
+  (case (first pid)
+    :Pid (let [[_ n id cr] pid]
+           (if (and (= n self) (= cr creation)) [:Local id] pid))
+    pid))
 
 (defn on-nodedown
   "What losing node n does here, given the links and monitors from local
@@ -64,10 +63,11 @@
 ;;   A -> B  [:reply cA (sign cB)]
 ;;   B -> A  [:ack (sign cA)]
 ;;
-;; Each step takes this end's state, the frame read, and ctx: {:up? f
-;; :pending? f :fresh c :sign f} -- whether this node is connected to, or
-;; connecting to, a peer; a fresh challenge, should this step need one; and
-;; how to sign a challenge with the cookie.  It answers [:Next hs frames],
+;; Each step takes this end's state, the frame read, and ctx: {:up-creation
+;; f :pending? f :fresh c :sign f} -- the creation of the run of a peer
+;; this node is connected to (nil when it is not), whether it is connecting
+;; to a peer; a fresh challenge, should this step need one; and how to sign
+;; a challenge with the cookie.  It answers [:Next hs frames],
 ;; [:Up hs frames] once the peer is proved, or [:Fail reason frames]: the
 ;; frames to send either way.
 
@@ -77,15 +77,33 @@
   (pos? (compare (str a) (str b))))
 
 (defn name-status
-  "What node self answers peer's name with: :nok for its own name, or a
-  peer it is connecting to itself while its own name sorts higher (that
-  connection is kept instead); :alive when it is connected already; :ok."
-  [self peer up? pending?]
+  "What node self answers peer, in its run creation, with: :nok for its
+  own name, or a peer it is connecting to itself while its own name sorts
+  higher (that connection is kept instead); :alive when it is connected to
+  that run of peer already; :ok -- also when the connection it has is to
+  an earlier run of peer, which this one replaces."
+  [self peer creation up-creation pending?]
   (cond
     (= self peer) :nok
-    up? :alive
+    (= creation up-creation) :alive
+    (some? up-creation) :ok
     (and pending? (sorts-higher? self peer)) :nok
     :else :ok))
+
+(defn on-up
+  "What node self does with a connection to a peer that has just come up,
+  given the one it has already: nil, or {:creation c :initiator node},
+  initiator the node that opened it.  :install it when there is none;
+  :replace-down when the one there is to an earlier run of the peer, which
+  goes down first; when both are to the same run, both ends keep the one
+  the higher-named node opened, so they agree: :replace or :drop."
+  [self existing new]
+  (cond
+    (nil? existing) :install
+    (not= (:creation existing) (:creation new)) :replace-down
+    (and (not= (:initiator existing) (:initiator new))
+         (sorts-higher? (:initiator new) (:initiator existing))) :replace
+    :else :drop))
 
 (defn open-handshake
   "Start a handshake from node self, in its run creation, to node peer."
@@ -107,7 +125,7 @@
     (cond
       (and (= :name phase) (= :name tag))
       (let [[_ peer cr] frame
-            st (name-status (:self hs) peer ((:up? ctx) peer) ((:pending? ctx) peer))]
+            st (name-status (:self hs) peer cr ((:up-creation ctx) peer) ((:pending? ctx) peer))]
         (if (= :ok st)
           [:Next (assoc hs :phase :reply :peer peer :peer-creation cr :mine (:fresh ctx))
            [[:status :ok] [:challenge (:self hs) (:creation hs) (:fresh ctx)]]]

@@ -415,16 +415,26 @@ The layers, bottom up:
   splits its stream the way a network might.
 - **Framing and codec**: a frame is its length, four bytes big-endian,
   then its payload, which a `Codec` (`ensemble.codec`, EDN by default,
-  `start!`'s `:codec`) turns into a value. Pids and throwables become
-  plain data before the codec sees them.
+  `start!`'s `:codec`) turns into a value. A frame larger than `start!`'s
+  `:max-frame` (64 MB by default) drops the connection, as does one that
+  doesn't decode.
+- **Envelope**: each frame after the handshake is `[op hdr body]`. `hdr`
+  holds the operation's own fields (the pids it names, a ref, a name) and
+  `body` the data it carries, a message or an exit reason. Pids and
+  throwables in the body are tagged and data that looks like a tag is
+  escaped, so a message arrives exactly as it was sent. Sending something
+  the wire can't carry (a record, an atom, a fn) throws at the sender; a
+  throwable arrives as an `ex-info` with its message and data.
 - **Handshake**: a connection is used only after the handshake, Erlang's
   shape: the connecting node sends its name and creation, the other answers
   with a status (`:nok` for a name it won't take, `:alive` when it's
-  connected already, and of two nodes connecting to each other at once only
-  one connection survives) and a challenge, and each end proves it holds
+  connected to that run of the node already, and of two nodes connecting
+  to each other at once only one connection survives) and a challenge, and each end proves it holds
   the cookie by signing the other's challenge with HMAC-SHA256. `start!`'s
   `:cookie` sets it (by default nodes in one VM share a cookie drawn at
-  startup), or `:auth` takes any `ensemble.node/Auth`.
+  startup), or `:auth` takes any `ensemble.node/Auth`. A connection that
+  hasn't shaken hands within `:handshake-timeout` is closed, and a node
+  that restarts is let in, its earlier run going down first.
 - **Creation**: each start of a node draws a creation number that its pids
   and refs carry, so a pid of an earlier run names no process, though its
   id may be in use again.

@@ -61,7 +61,7 @@
     (node/with-node a (node/connect! b))
     (is (eventually #(= [[:nodeup b]] @got)))
     (node/with-node a (node/disconnect! b))
-    (is (eventually #(= [[:nodeup b] [:nodedown b]] @got)))
+    (is (eventually #(= [[:nodeup b] [:nodedown b]] @got)) (pr-str @got))
     (act/exit! w :kill)))
 
 (deftest act-nodes-lists-the-connected-nodes
@@ -87,7 +87,7 @@
   (let [[a b] (nodes 2)
         r (try (node/with-node a (rpc/call b `boom [])) (catch Throwable e (ex-data e)))]
     (is (= :exception (first (:reason r))))
-    (is (= "rpc boom" (get-in r [:reason 1 :ensemble.node/exception])))))
+    (is (= "rpc boom" (ex-message (get-in r [:reason 1]))) "the throwable crosses as an ex-info")))
 
 (deftest rpc-call-times-out
   (let [[a b] (nodes 2)]
@@ -254,3 +254,17 @@
   (let [[a b] (nodes 2)
         p (node/with-node b (act/spawn idle))]
     (is (= :badarg (try (node/with-node a (pg/join :g3 p)) (catch Throwable e (:reason (ex-data e))))))))
+
+(deftest a-pg-demonitor-drops-the-scopes-monitor-of-the-watcher
+  (let [a (fresh-node)
+        mons #(node/with-node a (count (act/process-info (act/whereis :ensemble.pg/scope) :monitors)))
+        before (mons)
+        r (promise)]
+    (node/with-node a
+      (act/spawn (fn []
+                   (let [[ref _] (pg/monitor :dm)
+                         during (mons)]
+                     (pg/demonitor :dm ref)
+                     (deliver r [during (mons)]))
+                   (receive [:never nil]))))
+    (is (= [(inc before) before] (deref r 2000 nil)))))

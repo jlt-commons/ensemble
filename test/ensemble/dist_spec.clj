@@ -7,6 +7,8 @@
     elsewhere goes to that node.  The same send, !, serves both.
   - Pids travel inside messages.  On arrival, a pid of the receiving node is
     that node's own process again; a pid of any other node stays remote.
+    (Where in a frame a pid is, the node's envelope says; this decides
+    each one.)
   - When the connection to a node goes down, every link to one of its
     processes is broken with the exit reason noconnection, every monitor of
     one gets a DOWN with noconnection, and every monitor_node of it gets
@@ -19,7 +21,9 @@
     and creation; the other answers with a status -- ok, nok when the name
     is its own or it is connecting to the same peer and its own name sorts
     higher (so of two simultaneous connections one is kept), alive when it
-    is already connected -- and with a challenge.  Each end proves it holds
+    is already connected to that run of the peer -- and with a challenge.
+    A connection to an earlier run of the peer gives way to the new run, as
+    Erlang's does, and that earlier run goes down.  Each end proves it holds
     the cookie by signing the other's challenge; a wrong signature ends the
     handshake, and only after it does any other frame count.
   - A frame on the wire is its length as four bytes, big-endian, then its
@@ -40,9 +44,10 @@
 (data Step (Next Any (Vec Any)) (Up Any (Vec Any)) (Fail Any (Vec Any)))
 
 (ann route [Keyword Nat Dest -> Route])
-(ann arrive [Keyword Nat Any -> Any])
+(ann arrive [Keyword Nat Dest -> Any])
+(ann on-up [Keyword Any Any -> Keyword])
 (ann on-nodedown [Keyword (Vec Link) (Vec Mon) (Vec NodeMon) -> (Vec Effect)])
-(ann name-status [Keyword Keyword Bool Bool -> Keyword])
+(ann name-status [Keyword Keyword Nat Any Bool -> Keyword])
 (ann sorts-higher? [Keyword Keyword -> Bool])
 (ann open-handshake [Keyword Nat Keyword -> Step])
 (ann accept-handshake [Keyword Nat -> Any])
@@ -83,34 +88,15 @@
 ;; --- pids in messages ---------------------------------------------------
 
 (law a-pid-of-the-receiver-is-its-own-again
-  {:require :tested :because "a pid may be anywhere in a message, which clojure.walk walks and the prover does not model"}
   (forall [self Keyword, cr Nat, id Nat] (= (arrive self cr [:Pid self id cr]) [:Local id])))
 
 (law a-pid-of-an-earlier-run-stays-a-pid
-  {:require :tested :because "a pid may be anywhere in a message, which clojure.walk walks and the prover does not model"}
   (forall [self Keyword, cr Nat, old Nat, id Nat]
     (=> (not= cr old) (= (arrive self cr [:Pid self id old]) [:Pid self id old]))))
 
 (law a-pid-of-another-node-stays-remote
-  {:require :tested :because "a pid may be anywhere in a message, which clojure.walk walks and the prover does not model"}
   (forall [self Keyword, cr Nat, n Keyword, id Nat]
     (=> (not= self n) (= (arrive self cr [:Pid n id cr]) [:Pid n id cr]))))
-
-(law pids-inside-a-message-arrive-too
-  {:require :tested :because "a pid may be anywhere in a message, which clojure.walk walks and the prover does not model"}
-  (forall [self Keyword, cr Nat, n Keyword, id Nat, k Keyword]
-    (=> (not= self n)
-        (= (arrive self cr [k [:Pid self id cr] [:Pid n id cr]]) [k [:Local id] [:Pid n id cr]]))))
-
-(law a-pid-inside-a-map-arrives-too
-  {:require :tested :because "a pid may be anywhere in a message, which clojure.walk walks and the prover does not model"}
-  (forall [self Keyword, cr Nat, id Nat]
-    (= (arrive self cr {:to [:Pid self id cr] :from #{[:Pid self id cr]}}) {:to [:Local id] :from #{[:Local id]}})))
-
-(law data-without-pids-arrives-unchanged
-  {:require :tested :because "a pid may be anywhere in a message, which clojure.walk walks and the prover does not model"}
-  (forall [self Keyword, cr Nat, xs (Vec Int), k Keyword]
-    (= (arrive self cr [k xs]) [k xs])))
 
 ;; --- a node goes down ---------------------------------------------------
 
@@ -150,20 +136,40 @@
 ;; --- the handshake -------------------------------------------------------
 
 (law a-name-status-is-ok-for-a-new-peer
-  (forall [self Keyword, peer Keyword]
-    (=> (not= self peer) (= :ok (name-status self peer false false)))))
+  (forall [self Keyword, peer Keyword, cr Nat]
+    (=> (not= self peer) (= :ok (name-status self peer cr nil false)))))
 
 (law a-node-refuses-its-own-name
-  (forall [self Keyword, up Bool, pending Bool] (= :nok (name-status self self up pending))))
+  (forall [self Keyword, cr Nat, up Nat, pending Bool] (= :nok (name-status self self cr up pending))))
 
 (law a-node-already-connected-is-alive
-  (forall [self Keyword, peer Keyword, pending Bool]
-    (=> (not= self peer) (= :alive (name-status self peer true pending)))))
+  (forall [self Keyword, peer Keyword, cr Nat, pending Bool]
+    (=> (not= self peer) (= :alive (name-status self peer cr cr pending)))))
+
+(law a-restarted-peer-is-let-in
+  (forall [self Keyword, peer Keyword, cr Nat, old Nat, pending Bool]
+    (=> (and (not= self peer) (not= cr old)) (= :ok (name-status self peer cr old pending)))))
 
 ;; of two simultaneous connections, the one from the higher name is kept
 (law a-simultaneous-connection-keeps-the-higher-names
-  (and (= :nok (name-status :b.vm :a.vm false true))
-       (= :ok (name-status :a.vm :b.vm false true))))
+  (and (= :nok (name-status :b.vm :a.vm 1 nil true))
+       (= :ok (name-status :a.vm :b.vm 1 nil true))))
+
+;; a connection that comes up beside another: both ends decide alike
+(law a-first-connection-is-installed
+  (forall [self Keyword, cr Nat, i Keyword]
+    (= :install (on-up self nil {:creation cr :initiator i}))))
+
+(law a-connection-to-a-new-run-replaces-the-old-which-goes-down
+  (forall [self Keyword, cr Nat, old Nat, i Keyword, j Keyword]
+    (=> (not= cr old)
+        (= :replace-down (on-up self {:creation old :initiator i} {:creation cr :initiator j})))))
+
+(law of-two-connections-to-one-run-the-higher-openers-stays
+  (and (= :replace (on-up :a.vm {:creation 1 :initiator :a.vm} {:creation 1 :initiator :b.vm}))
+       (= :drop (on-up :a.vm {:creation 1 :initiator :b.vm} {:creation 1 :initiator :a.vm}))
+       (= :replace (on-up :b.vm {:creation 1 :initiator :a.vm} {:creation 1 :initiator :b.vm}))
+       (= :drop (on-up :b.vm {:creation 1 :initiator :b.vm} {:creation 1 :initiator :a.vm}))))
 
 (defn sign-with
   "A signer holding cookie: what the shell computes as an HMAC, modelled as
@@ -175,7 +181,7 @@
   "A handshake context with no other connection, signing with cookie and
   drawing fresh as its challenge."
   [cookie fresh]
-  {:up? (fn [_] false) :pending? (fn [_] false) :fresh fresh :sign (sign-with cookie)})
+  {:up-creation (fn [_] nil) :pending? (fn [_] false) :fresh fresh :sign (sign-with cookie)})
 
 ;; a's name reaches b, b's status and challenge reach a, a's reply reaches
 ;; b, b's ack reaches a
@@ -199,33 +205,33 @@
 
 (law the-acceptor-proves-itself-too
   ;; the initiator checks the acceptor's answer to its challenge
-  (let [ctx {:up? (fn [_] false) :pending? (fn [_] false) :fresh :ca :sign (sign-with "c")}
+  (let [ctx {:up-creation (fn [_] nil) :pending? (fn [_] false) :fresh :ca :sign (sign-with "c")}
         [_ ia _] (open-handshake :a.vm 1 :b.vm)
         [_ ia] (handshake ia [:status :ok] ctx)
         [_ ia] (handshake ia [:challenge :b.vm 2 :cb] ctx)]
     (= [:Fail :bad-cookie []] (handshake ia [:ack [:signed "d" :ca]] ctx))))
 
 (law a-refusing-status-ends-the-handshake
-  (let [ctx {:up? (fn [_] false) :pending? (fn [_] false) :fresh :ca :sign (sign-with "c")}
+  (let [ctx {:up-creation (fn [_] nil) :pending? (fn [_] false) :fresh :ca :sign (sign-with "c")}
         [_ ia _] (open-handshake :a.vm 1 :b.vm)]
     (and (= [:Fail [:refused :nok] []] (handshake ia [:status :nok] ctx))
          (= [:Fail [:refused :alive] []] (handshake ia [:status :alive] ctx)))))
 
 (law the-acceptor-answers-a-refused-name-and-stops
-  (let [ctx {:up? (fn [p] (= p :a.vm)) :pending? (fn [_] false) :fresh :cb :sign (sign-with "c")}]
+  (let [ctx {:up-creation (fn [p] (when (= p :a.vm) 1)) :pending? (fn [_] false) :fresh :cb :sign (sign-with "c")}]
     (and (= [:Fail [:refused :alive] [[:status :alive]]]
             (handshake (accept-handshake :b.vm 2) [:name :a.vm 1] ctx))
          (= [:Fail [:refused :nok] [[:status :nok]]]
             (handshake (accept-handshake :b.vm 2) [:name :b.vm 1] ctx)))))
 
 (law the-peer-must-be-the-node-asked-for
-  (let [ctx {:up? (fn [_] false) :pending? (fn [_] false) :fresh :ca :sign (sign-with "c")}
+  (let [ctx {:up-creation (fn [_] nil) :pending? (fn [_] false) :fresh :ca :sign (sign-with "c")}
         [_ ia _] (open-handshake :a.vm 1 :b.vm)
         [_ ia] (handshake ia [:status :ok] ctx)]
     (= [:Fail [:wrong-node :c.vm] []] (handshake ia [:challenge :c.vm 2 :cb] ctx))))
 
 (law a-frame-out-of-turn-ends-the-handshake
-  (let [ctx {:up? (fn [_] false) :pending? (fn [_] false) :fresh :cb :sign (sign-with "c")}]
+  (let [ctx {:up-creation (fn [_] nil) :pending? (fn [_] false) :fresh :cb :sign (sign-with "c")}]
     (and (= [:Fail [:unexpected [:send 1 :x]] []]
             (handshake (accept-handshake :b.vm 2) [:send 1 :x] ctx))
          (= [:Fail [:unexpected [:ack :x]] []]
