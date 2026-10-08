@@ -85,6 +85,8 @@
 (ann next-queues [Bool Bool Any (Vec Any) (Vec Any) (Vec Any) -> Queues])
 (ann next-timers [Bool (Map Any Any) (Vec Any) -> (Map Any Any)])
 (ann restarted [Bool (Map Any Any) (Vec Any) -> (Set Any)])
+(ann enter-timers [(Map Any Any) (Vec Any) -> (Map Any Any)])
+(ann enter-restarted [(Map Any Any) (Vec Any) -> (Set Any)])
 
 ;; --- the state graph ----------------------------------------------------
 
@@ -396,6 +398,19 @@
           [[false {} [[:event 1 :a] [:state :update :b]]]
            [true {:state [1 :a]} [[:state :update :b] [[:generic :g] nil nil]]]
            [false {[:generic :g] [1 :a]} [[[:generic :g] 2 :b] [[:generic :g] nil nil]]]]))
+
+;; an enter call runs before any new event, so the transition's event
+;; timeout stands; the enter call's own actions apply on top of it
+(law an-enter-call-keeps-the-event-timeout
+  (and (= (enter-timers {:event [5 :a]} []) {:event [5 :a]})
+       (= (enter-timers {:event [5 :a] :state [3 :s]} [[:state 9 :b]]) {:event [5 :a] :state [9 :b]})
+       (= (enter-timers {:event [5 :a]} [[:event nil nil]]) {})))
+
+(law an-enter-call-restarts-what-it-sets
+  (and (= (enter-restarted {:event [5 :a]} []) #{})
+       (= (enter-restarted {:event [5 :a]} [[:event :update :b]]) #{})
+       (= (enter-restarted {} [[:event :update :b]]) #{:event})
+       (= (enter-restarted {:event [5 :a]} [[:state 1 :b]]) #{:state})))
 
 (law the-last-action-for-a-timer-wins
   (= (next-timers false {} [[:state 1 :a] [:state 2 :b]]) {:state [2 :b]}))

@@ -240,11 +240,9 @@
   [changed? timers timeouts]
   (reduce set-timer (carried changed? timers) timeouts))
 
-(defn restarted
-  "The keys of the timers a transition starts anew: those an action sets,
-  and those an update finds not running.  An update of a running timer
-  keeps its deadline, and a cancel ends whatever was started."
-  [changed? timers timeouts]
+(defn- started-keys
+  "The keys of the timers that timeouts start anew from ts."
+  [ts timeouts]
   (second
    (reduce (fn [[ts started] [k ms _ :as t]]
              [(set-timer ts t)
@@ -252,5 +250,24 @@
                 (nil? ms) (disj started k)
                 (and (= :update ms) (contains? ts k)) started
                 :else (conj started k))])
-           [(carried changed? timers) #{}]
+           [ts #{}]
            timeouts)))
+
+(defn restarted
+  "The keys of the timers a transition starts anew: those an action sets,
+  and those an update finds not running.  An update of a running timer
+  keeps its deadline, and a cancel ends whatever was started."
+  [changed? timers timeouts]
+  (started-keys (carried changed? timers) timeouts))
+
+(defn enter-timers
+  "The timers after an enter call: its timer actions applied to the
+  transition's, which it keeps whole -- the event timeout included, since
+  no event has arrived since."
+  [timers timeouts]
+  (reduce set-timer timers timeouts))
+
+(defn enter-restarted
+  "The keys of the timers an enter call starts anew."
+  [timers timeouts]
+  (started-keys timers timeouts))

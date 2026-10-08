@@ -151,3 +151,39 @@
     (is (thrown? Throwable (app/ensure-all-started! ::rb-c)))
     (is (= [:b :a] @log))
     (is (not (app/started? ::rb-a)))))
+
+;; --- failures around start and stop -------------------------------------------
+
+(deftest a-tree-dead-on-start-leaves-a-consistent-record
+  (app/load! (spec ::stillborn
+                   :start (fn [] (let [t (tree)] (act/exit! t :kill) (act/exit-reason t 1000) t))))
+  (try (app/start! ::stillborn) (catch Throwable _ nil))
+  (is (eventually #(not (app/started? ::stillborn))) "a dead tree is not running")
+  (is (not (some #{::stillborn} (app/which-applications))))
+  (app/stop! ::stillborn))
+
+(deftest a-throwing-prep-stop-still-stops-the-tree
+  (let [log (atom [])]
+    (app/load! (spec ::bad-prep
+                     :prep-stop (fn [_] (throw (ex-info "prep" {})))
+                     :stop (fn [st] (swap! log conj [:stop st]))))
+    (app/start! ::bad-prep)
+    (let [top (:top (get @@#'app/running ::bad-prep))]
+      (is (thrown? Throwable (app/stop! ::bad-prep)) "stop! reports the failure")
+      (is (false? (act/alive? top)) "the tree is stopped all the same")
+      (is (= [[:stop ::bad-prep]] @log) ":stop runs with the state prep-stop was given"))))
+
+(deftest stop-all-gets-past-a-throwing-prep-stop
+  (app/load! (spec ::first))
+  (app/load! (spec ::bad-prep2 :prep-stop (fn [_] (throw (ex-info "prep" {})))))
+  (app/start! ::first)
+  (app/start! ::bad-prep2)
+  (#'app/stop-all!)
+  (is (not (app/started? ::first)) "the applications after the failing one stop too"))
+
+(deftest reloading-a-spec-takes-its-new-env
+  (app/load! (spec ::reloaded :env {:a 1 :b 1}))
+  (app/set-env! ::reloaded :b 2)
+  (app/load! (spec ::reloaded :env {:a 10 :b 10}))
+  (is (= 10 (app/get-env ::reloaded :a)) "a value from the old spec gives way to the new")
+  (is (= 2 (app/get-env ::reloaded :b)) "a value set-env! gave is kept"))

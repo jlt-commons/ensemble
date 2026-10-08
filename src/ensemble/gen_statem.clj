@@ -143,16 +143,23 @@
             [_ postponed queue] (if (= :enter kind)
                                   [:Queues (:postponed st) (:queue st)]
                                   (sm/next-queues changed? postpone? event (:postponed st) inserted (:queue st)))
-            timers (sm/next-timers changed? (:timers st) timeouts)
+            enter? (= :enter kind)
+            timers (if enter?
+                     (sm/enter-timers (:timers st) timeouts)
+                     (sm/next-timers changed? (:timers st) timeouts))
             ;; the event timeout only runs while nothing is waiting to be handled
             timers (if (seq queue) (dissoc timers :event) timers)
             st* (assoc st :state state :data data :postponed postponed :queue queue
                        :timers timers
-                       :deadlines (arm (sm/restarted changed? (:timers st) timeouts) timers (:deadlines st))
+                       :deadlines (arm (if enter?
+                                    (sm/enter-restarted (:timers st) timeouts)
+                                    (sm/restarted changed? (:timers st) timeouts))
+                                  timers (:deadlines st))
                        :hibernate (sm/hibernate? actions))]
         (doseq [[from v] replies] (reply! from v))
-        ;; a repeat runs the enter call again as if the state were new
-        (if (and (or changed? (= :Repeat tag)) (:state-enter opts))
+        ;; a repeat runs the enter call again as if the state were new; one
+        ;; from an enter call is a keep, as OTP's is
+        (if (and (or changed? (and (= :Repeat tag) (not enter?))) (:state-enter opts))
           (transition! m opts st* [:enter (:state st)] :enter)
           st*)))))
 

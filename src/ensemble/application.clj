@@ -30,6 +30,7 @@
   OTP would stop the node."
   (:require [ensemble.actor :as act :refer [receive]]
             [ensemble.gen-server :as gs]
+            [ensemble.logger :as logger]
             [ensemble.signal :as sig]))
 
 (defonce ^:private loaded (atom {}))
@@ -51,8 +52,11 @@
   configuration, under any value set-env! has given a key already.
   Returns its name."
   [spec]
-  (swap! loaded assoc (:name spec) spec)
-  (swap! envs update (:name spec) #(merge (:env spec) %))
+  (let [old (:env (get @loaded (:name spec)))
+        ;; the values a spec loaded before gave, as opposed to set-env!'s
+        set-by-hand (fn [env] (into {} (remove (fn [[k v]] (and (contains? old k) (= v (get old k))))) env))]
+    (swap! loaded assoc (:name spec) spec)
+    (swap! envs update (:name spec) #(merge (:env spec) (set-by-hand %))))
   (:name spec))
 
 (defn get-key
@@ -100,15 +104,18 @@
 (declare stop-all!)
 
 (defn- master
-  "The application master: monitor the tree; when it exits without stop!,
-  forget the application and act on its type."
+  "The application master: once told ::go, monitor the tree; when it exits
+  without stop!, forget the application and act on its type."
   [name top kind]
   (act/spawn
    (fn []
+     ;; start! records the application before it says go, so a tree dead
+     ;; already is not mistaken for one still starting
+     (receive [::go nil])
      (let [ref (act/monitor! top)]
        (receive
         [[:DOWN ref :process _ reason]
-         (when (get @running name)
+         (when (= top (:top (get @running name)))
            (swap! running dissoc name)
            (swap! started-order (fn [o] (filterv #(not= name %) o)))
            (swap! exit-log conj [name reason])
@@ -149,8 +156,9 @@
         (swap! running dissoc name)
         (fail [:bad-return r]))
       (swap! started-order (fn [o] (conj (filterv #(not= name %) o) name)))
-      (swap! running assoc name {:spec spec :top top :state state
-                                 :master (master name top (:type spec :temporary))})
+      (let [m (master name top (:type spec :temporary))]
+        (swap! running assoc name {:spec spec :top top :state state :master m})
+        (act/! m ::go))
       (try (run-phases! spec)
            (catch Throwable e (stop! name) (throw e)))
       :ok)))
@@ -193,17 +201,25 @@
         (swap! started-order (fn [o] (filterv #(not= name %) o)))
         ;; the master stops watching, so the tree's exit is not a crash
         (act/! master ::stop)
-        (let [state (if-let [prep (:prep-stop spec)] (prep state) state)]
+        ;; a prep-stop that throws does not keep the tree up: it stops, :stop
+        ;; gets the state prep-stop was given, and then stop! throws
+        (let [[state failed] (if-let [prep (:prep-stop spec)]
+                               (try [(prep state)] (catch Throwable e [state e]))
+                               [state])]
           (when (act/alive? top)
             (try (gs/stop! top :shutdown) (catch Throwable _ (act/exit! top :kill))))
           (when-let [stop (:stop spec)] (stop state))
+          (when failed (throw failed))
           :ok)))))
 
 (defn- stop-all!
   "Stop every running application, the last started first, as OTP stops
   them with the node: an application stops before those it depends on."
   []
-  (doseq [n (rseq @started-order)] (stop! n)))
+  (doseq [n (rseq @started-order)]
+    (try (stop! n)
+         (catch Throwable e
+           (logger/report! {:level :error :kind :application-stop-failed :application n :reason e})))))
 
 (defn which-applications
   "The names of the running applications, in the order they started."

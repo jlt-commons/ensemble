@@ -357,3 +357,32 @@
     (is (= :open (gs/call! m :state?)))
     (gs/stop! m)
     (is (= :normal (act/exit-reason m 1000)))))
+
+;; --- enter calls: repeat_state and the transition's event timeout ------------
+
+(defrecord EnterRepeat [log]
+  sm/Machine
+  (init [_] [:ok :a nil])
+  (handle-event [_ type content state _]
+    (swap! log conj [type state])
+    (cond
+      (= :enter type) [:repeat-state-and-data]
+      (= :cast type) [:next-state content nil [[:timeout 30 :quiet]]]
+      (= :timeout type) [:keep-state-and-data]
+      :else [:keep-state-and-data [[:reply (second type) state]]]))
+  (terminate [_ _ _ _] nil))
+
+(deftest an-enter-call-that-repeats-keeps-the-state
+  (let [log (atom [])
+        m (sm/start (->EnterRepeat log) {:state-enter true})]
+    (is (= :a (gs/call! m :state 1000)) "the machine survives its enter call")
+    (is (= 1 (count (filter #(= :enter (first %)) @log))) "the enter call runs once")
+    (gs/stop! m)))
+
+(deftest an-enter-call-keeps-the-transitions-event-timeout
+  (let [log (atom [])
+        m (sm/start (->EnterRepeat log) {:state-enter true})]
+    (gs/cast! m :b)
+    (sleep 150)
+    (is (some #{[:timeout :b]} @log) "the event timeout set with the transition fires")
+    (gs/stop! m)))

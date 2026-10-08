@@ -164,3 +164,37 @@
     (a/<!! (a/timeout 50))
     (act/! owner :check)
     (is (= :alive (act/join owner 2000)))))
+
+(deftest a-start-link-parent-stays-linked-when-its-handler-goes
+  (let [mp (promise)
+        owner (act/spawn (fn []
+                           (let [m (ev/start-link)]
+                             (ev/add-sup-handler! m :a (->Sink (atom [])))
+                             (ev/delete-handler! m :a)
+                             (deliver mp m)
+                             (receive [:never nil]))))]
+    (act/exit! (deref mp 1000 nil) :kill)
+    (is (= :killed (act/exit-reason owner 1000)) "the start-link link is kept")))
+
+(deftest swapping-a-supervised-handler-tells-its-owner
+  (let [m (ev/start)
+        ready (promise)
+        owner (act/spawn (fn []
+                           (ev/add-sup-handler! m :a (->Infoed (atom []) :a))
+                           (deliver ready true)
+                           (receive [[:gen-event-EXIT id reason] [id reason]]
+                                    [:after 1000 :nothing])))]
+    (deref ready 1000 nil)
+    (ev/swap-handler! m :a :bye :b (fn [_] (->Infoed (atom []) :b)))
+    (is (= [:a [:swapped :b nil]] (act/join owner 2000)))))
+
+(deftest swapping-to-the-same-owner-then-deleting-unlinks-it
+  (let [m (ev/start)
+        owner (act/spawn (fn []
+                           (ev/add-sup-handler! m :a (->Infoed (atom []) :a))
+                           (ev/swap-sup-handler! m :a :bye :b (fn [_] (->Infoed (atom []) :b)))
+                           (ev/delete-handler! m :b)
+                           (receive [:check (do (act/exit! m :kill) (receive [:never nil] [:after 100 nil]) :alive)])))]
+    (a/<!! (a/timeout 50))
+    (act/! owner :check)
+    (is (= :alive (act/join owner 2000)))))
