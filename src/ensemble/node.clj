@@ -21,7 +21,7 @@
     which a Codec (ensemble.codec, EDN by default) turns into a value;
   - a connection is used only once the handshake has named the peer and
     each end has proved it holds the cookie, by signing the other's
-    challenge with HMAC-SHA256;
+    challenge, with its own name and the other's, with HMAC-SHA256;
   - then frames carry the operations of the distribution protocol, each
     an envelope [op hdr body]: hdr the operation's own fields (the pids
     it names, a ref, a name), body the data it carries -- a message, an
@@ -58,7 +58,8 @@
 (defprotocol Auth
   (-sign [a challenge]
     "Sign challenge, a string, as only a node that may connect could.
-    Both ends of a connection must sign alike."))
+    Both ends of a connection must sign alike.  The handshake's challenge
+    string names the node signing and the node it is for as well."))
 
 (defrecord CookieAuth [key]
   Auth
@@ -328,7 +329,8 @@
     {:up-creation (fn [p] (get-in s [:conns p :creation]))
      :pending? (fn [p] (contains? (:connecting s) p))
      :fresh (random-hex 16)
-     :sign (fn [c] (-sign (:auth s) (str c)))}))
+     ;; what is signed is [challenge signer verifier], printed
+     :sign (fn [v] (-sign (:auth s) (pr-str v)))}))
 
 (defn handshake-step!
   "Take a handshake frame on conn c of node n, through dist/handshake: send

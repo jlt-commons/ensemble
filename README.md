@@ -430,7 +430,10 @@ The layers, bottom up:
   with a status (`:nok` for a name it won't take, `:alive` when it's
   connected to that run of the node already, and of two nodes connecting
   to each other at once only one connection survives) and a challenge, and each end proves it holds
-  the cookie by signing the other's challenge with HMAC-SHA256. `start!`'s
+  the cookie by signing the other's challenge with HMAC-SHA256. The
+  signature covers both node names as well as the challenge, unlike
+  Erlang's, so a node without the cookie can't relay one node's answer to
+  a third and get in under its name. `start!`'s
   `:cookie` sets it (by default nodes in one VM share a cookie drawn at
   startup), or `:auth` takes any `ensemble.node/Auth`. A connection that
   hasn't shaken hands within `:handshake-timeout` is closed, and a node
@@ -482,7 +485,8 @@ The layers, bottom up:
 - **Passivation is an extension.** Erlang's hibernation stays in memory.
 - **Distribution ships only the loopback transport**; a network transport
   is a library implementing `ensemble.transport`. The cookie handshake
-  signs with HMAC-SHA256 rather than Erlang's MD5 digest, and the frames
+  signs with HMAC-SHA256 over the challenge and both names rather than
+  Erlang's MD5 digest of the challenge, and the frames
   are EDN, not the external term format, so ensemble nodes do not talk to
   Erlang nodes. global and pg have the default scope only.
 - There is no hot code loading, and no reductions (jolt preempts fibers on

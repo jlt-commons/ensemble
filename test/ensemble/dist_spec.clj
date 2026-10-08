@@ -203,6 +203,27 @@
         [_ _ out-a] (handshake ia (second out-b) (ctx-for "c" :ca))]
     (= [:Fail :bad-cookie []] (handshake hb (first out-a) (ctx-for "d" :cb)))))
 
+;; a node m without the cookie gets a to dial it and hands a the challenge
+;; c sent m: what a signs names m as the node it answers, so c, expecting
+;; itself there, refuses it
+(law a-signature-relayed-to-another-node-is-refused
+  (let [;; c's side: m claims to be a
+        [_ hc out-c] (handshake (accept-handshake :c.vm 3) [:name :a.vm 1] (ctx-for "k" :cc))
+        cc (nth (second out-c) 3)
+        ;; a dialed m, and m passes c's challenge on as its own
+        [_ ia] (handshake (second (open-handshake :a.vm 1 :m.vm)) [:status :ok] (ctx-for "k" :ca))
+        [_ _ out-a] (handshake ia [:challenge :m.vm 9 cc] (ctx-for "k" :ca))]
+    (= [:Fail :bad-cookie []] (handshake hc (first out-a) (ctx-for "k" :cc)))))
+
+;; nor does an end's own challenge, reflected back to it, prove the peer
+(law a-reflected-ack-is-refused
+  (let [ctx (ctx-for "k" :ca)
+        [_ ia] (handshake (second (open-handshake :a.vm 1 :b.vm)) [:status :ok] ctx)
+        [_ ia out-a] (handshake ia [:challenge :b.vm 2 :cb] ctx)
+        ;; what a signed for b, sent back to a as b's proof
+        [_ _ sig] (first out-a)]
+    (= [:Fail :bad-cookie []] (handshake ia [:ack sig] ctx))))
+
 (law the-acceptor-proves-itself-too
   ;; the initiator checks the acceptor's answer to its challenge
   (let [ctx {:up-creation (fn [_] nil) :pending? (fn [_] false) :fresh :ca :sign (sign-with "c")}
