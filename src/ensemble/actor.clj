@@ -112,9 +112,20 @@
 
 (defn make-ref
   "A unique reference (Erlang's make_ref), for tagging a request so its reply
-  can be told apart from every other message."
+  can be told apart from every other message.  It carries the node that made
+  it, so refs from two runtimes never collide."
   []
-  {::ref (swap! counter inc)})
+  {::ref (swap! counter inc) ::node (node)})
+
+(defn ref-node
+  "The node a ref was made on."
+  [r]
+  (::node r))
+
+(defn timeout-ms
+  "A timeout as ms, or nil for none: nil and :infinity both wait forever."
+  [t]
+  (when-not (= :infinity t) t))
 
 ;; process table and registry -------------------------------------------
 
@@ -401,27 +412,44 @@
 
 (defn- watched? [x] (and (some? x) (not= ::firing x)))
 
+(defn- name-object
+  "What a DOWN names for a monitor made by name, Erlang's {RegName, Node}:
+  [:At name node]."
+  [dest]
+  (if (vector? dest)
+    [:At (norm-name (second dest)) (nth dest 2)]
+    [:At (norm-name dest) (node)]))
+
 (defn monitor!
-  "Monitor actor from the current actor.  Returns a ref.  When actor exits,
-  the current actor receives [:DOWN ref :process actor reason]; if it is
-  already dead the reason is :noproc.  A monitor is one-way: the monitoring
-  actor is never affected by the exit.  Each call makes a new monitor."
-  [actor]
+  "Monitor dest -- a process, a name, or [:At name node] -- from the current
+  actor.  Returns a ref.  When the process exits, the current actor
+  receives [:DOWN ref :process object reason], object the process, or
+  [:At name node] for a monitor made by name; reason is :noproc if it was
+  already dead, or no process held the name.  A monitor is one-way: the
+  monitoring actor is never affected by the exit.  Each call makes a new
+  monitor."
+  [dest]
   (let [me (self)
-        actor (resolve-dest actor)
+        obj (when-not (pid? dest) (name-object dest))
+        actor (if obj (try (resolve-dest dest) (catch Throwable _ nil)) dest)
         ref (make-ref)
-        watching (::monitoring me)]
-    (swap! watching assoc ref actor)
-    ;; the entry in watching is a one-shot claim: the DOWN is sent only by
-    ;; whoever turns it to ::firing, and demonitor! only by removing it, so
-    ;; a demonitor that wins knows no DOWN will ever come
-    (proc/-add-monitor actor ref
-                  (fn [reason]
-                    (let [[before _] (swap-vals! watching
-                                                 (fn [w] (if (watched? (get w ref)) (assoc w ref ::firing) w)))]
-                      (when (watched? (get before ref))
-                        (enqueue! me [:DOWN ref :process actor reason])
-                        (swap! watching dissoc ref)))))))
+        watching (::monitoring me)
+        who (or obj actor)]
+    (if (nil? actor)
+      ;; a name nobody holds: down at once
+      (do (enqueue! me [:DOWN ref :process who :noproc]) ref)
+      (do
+        (swap! watching assoc ref actor)
+        ;; the entry in watching is a one-shot claim: the DOWN is sent only by
+        ;; whoever turns it to ::firing, and demonitor! only by removing it, so
+        ;; a demonitor that wins knows no DOWN will ever come
+        (proc/-add-monitor actor ref
+                           (fn [reason]
+                             (let [[before _] (swap-vals! watching
+                                                          (fn [w] (if (watched? (get w ref)) (assoc w ref ::firing) w)))]
+                               (when (watched? (get before ref))
+                                 (enqueue! me [:DOWN ref :process who reason])
+                                 (swap! watching dissoc ref)))))))))
 
 (defn- flush!
   "Remove every mailbox message pred accepts."
@@ -815,12 +843,13 @@
 (defn receive-match
   "Block until a message matches one of the compiled patterns pats whose guard
   (ok? clause-index bindings) accepts it.  Returns [clause-index msg env], or
-  [:timeout] when timeout-ms (nil: wait forever) elapses first.  Exit signals
+  [:timeout] when timeout-ms (nil or :infinity: wait forever) elapses first.  Exit signals
   are acted on before each look at the mailbox."
   ([pats timeout-ms] (receive-match pats always timeout-ms))
   ([pats ok? timeout-ms]
    (let [me (or (self) (throw (ex-info "receive outside an actor" {})))
-         deadline (when timeout-ms (+ (System/currentTimeMillis) timeout-ms))]
+         timeout-ms (when-not (= :infinity timeout-ms) timeout-ms)
+         deadline (when timeout-ms (+ (now-ms) timeout-ms))]
      (loop [start 0]
        (drain-signals! me)
        (let [saved @(::saved me)
@@ -838,7 +867,7 @@
                :else
                (let [scanned (count @(::saved me))]
                  (if deadline
-                   (let [left (- deadline (System/currentTimeMillis))]
+                   (let [left (- deadline (now-ms))]
                      (if (pos? left)
                        (do (a/alts!! [(::bell me) (a/timeout left)]) (recur scanned))
                        [:timeout]))
@@ -883,7 +912,8 @@
   clauses:
 
       [:else & body]      matches the next message whatever it is
-      [:after ms & body]  runs body if nothing matches within ms (nil: never)
+      [:after ms & body]  runs body if nothing matches within ms (nil or
+                          :infinity: never)
 
   Returns the value of the chosen clause's body."
   [& clauses]

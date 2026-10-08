@@ -309,3 +309,35 @@
                                    (act/exit! a :shutdown)
                                    (act/exit-reason a 1000)))))))
     (is (every? #{:shutdown} (deref out 60000 [:timeout])))))
+
+;; --- :infinity is a timeout everywhere one is taken ------------------------
+
+(deftest receive-takes-infinity
+  (let [a (act/spawn (fn [] (receive [:x :got] [:after :infinity :never])))]
+    (act/! a :x)
+    (is (= :got (act/join a 1000)))))
+
+;; --- a monitor by name ------------------------------------------------------
+
+(deftest monitoring-a-name-nobody-holds-is-down-at-once
+  (let [a (act/spawn (fn [] (let [r (act/monitor! ::nobody)]
+                              (receive [[:DOWN r :process obj reason] [obj reason]]
+                                       [:after 1000 :no-down]))))]
+    (is (= [[:At :nobody (act/node)] :noproc] (act/join a 2000)))))
+
+(deftest a-monitor-by-name-reports-the-name
+  (let [t (act/spawn (fn [] (receive [:die (act/exit! :bye)])) {:name ::watched})
+        a (act/spawn (fn [] (let [r (act/monitor! ::watched)]
+                              (act/! t :die)
+                              (receive [[:DOWN r :process obj reason] [obj reason]]
+                                       [:after 1000 :no-down]))))]
+    (is (= [[:At :watched (act/node)] :bye] (act/join a 2000)))))
+
+;; --- refs carry their node --------------------------------------------------
+
+(deftest refs-made-on-different-nodes-differ
+  (let [r1 (binding [act/*node* :one.vm] (act/make-ref))
+        r2 (binding [act/*node* :two.vm] (act/make-ref))]
+    (is (= :one.vm (act/ref-node r1)))
+    (is (= :two.vm (act/ref-node r2)))
+    (is (not= (assoc r1 :ensemble.actor/ref 0) (assoc r2 :ensemble.actor/ref 0)))))

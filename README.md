@@ -62,7 +62,7 @@ is removed, every other message stays where it was.
   [[:add n] :when (pos? n) (add n)]  ; a guard; one that throws is false
   [[x x] :same]                      ; a repeated name must match equal values
   [msg (log msg)]                    ; binds the whole message
-  [:after 1000 :timeout])            ; ms, 0 polls, nil waits forever
+  [:after 1000 :timeout])            ; ms, 0 polls, nil or :infinity waits forever
 ```
 
 As in Erlang, a symbol bound where the `receive` is written is not a binder:
@@ -102,8 +102,12 @@ Inside any actor, `(act/state)`, `(act/set-state! v)` and
   ordinary, trappable reason. `:normal` sent to yourself exits you.
 - Linking to a dead process gives `:noproc`.
 - `monitor!` returns a ref; the watcher gets `[:DOWN ref :process actor
-  reason]`, with `:noproc` if the actor was already dead. `demonitor!` with
-  `{:flush true}` also removes a delivered DOWN.
+  reason]`, with `:noproc` if the actor was already dead. A monitor made by
+  name names it in the DOWN as `[:At name node]`, Erlang's `{Name, Node}`,
+  and is down at once with `:noproc` if no process holds the name.
+  `demonitor!` with `{:flush true}` also removes a delivered DOWN.
+- A ref (`make-ref`) carries the node that made it. Wherever a timeout is
+  taken, `nil` and `:infinity` both wait forever.
 - `register!` fails if the name is taken or the actor already has one, and a
   name is released when its actor exits.
 
@@ -203,11 +207,17 @@ gen_fsm is not provided; OTP deprecated it in favour of gen_statem.
 ## gen_event
 
 `ensemble.gen-event`: a manager hands each event to its handlers in order.
-`h-handle-event` returns `[:ok state]` or `:remove-handler`. A handler that
-throws is removed, with `h-terminate` called on `[:error reason]`, and the
-manager and the other handlers carry on. `add-sup-handler!` ties a handler to
-the calling actor both ways. `call!` talks to one handler (`:bad-module` if
-there is none), and `delete-handler!` returns what `h-terminate` returned.
+`h-handle-event` returns `[:ok state]`, `[:ok state :hibernate]` (the
+manager hibernates), `:remove-handler`, or `[:swap-handler reason state id
+f]`. A handler that throws is removed, with `h-terminate` called on
+`[:error reason]`, and the manager and the other handlers carry on. A
+handler that also implements `InfoHandler` gets the manager's other
+messages through `h-handle-info`. `add-sup-handler!` ties a handler to the
+calling actor both ways, and the link goes with the actor's last handler.
+`swap-handler!` and `swap-sup-handler!` replace a handler as OTP's do: the
+old one's `h-terminate` runs, and `(f what-it-returned)` is the new one.
+`call!` talks to one handler (`:bad-module` if there is none), and
+`delete-handler!` returns what `h-terminate` returned.
 
 ## Supervisors
 
@@ -333,7 +343,10 @@ process or on another machine.
   each `monitor-node!` gets `[:nodedown node]`. A link to a remote pid
   that is gone gives `:noproc`.
 - `spawn-on` starts a fn named by a symbol on the other node, as
-  `spawn(Node, M, F, A)` does.
+  `spawn(Node, M, F, A)` does, if that node allows it: `start!`'s `:spawn`
+  option is a set of namespaces or a predicate on the symbol, and without
+  it a node starts nothing for a peer, since peers aren't authenticated
+  yet.
 - Connections come from a `Transport`. The loopback transport joins nodes
   in one VM, but each frame is still printed and read back as EDN, so what
   crosses is exactly what a wire would carry. A socket transport plugs in

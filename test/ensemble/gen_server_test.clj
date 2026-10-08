@@ -430,3 +430,14 @@
   (let [c (act/spawn (fn [] (try (gs/start-link (->SlowInit 5000) {:timeout 50})
                                  (catch Throwable e (:reason (ex-data e))))))]
     (is (= :timeout (act/join c 2000)))))
+
+(deftest call-and-stop-take-infinity
+  (let [s (gs/start (->SlowInit 0) {:timeout :infinity})]
+    (is (= :up (gs/call! s :get :infinity)))
+    (is (= :up (act/join (act/spawn (fn [] (gs/call! s :get :infinity))) 1000)))
+    (is (= :ok (gs/stop! s :normal :infinity)))))
+
+(deftest wait-response-takes-infinity
+  (let [s (gs/start (->SlowInit 0))
+        a (act/spawn (fn [] (gs/wait-response (gs/send-request s :get) :infinity)))]
+    (is (= [:reply :up] (act/join a 1000)))))

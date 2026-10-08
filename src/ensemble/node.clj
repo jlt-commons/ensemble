@@ -242,6 +242,19 @@
 
 ;; --- frames from a peer -------------------------------------------------
 
+(defn- spawn-allowed?
+  "May node n start the fn named sym for a peer?  Only what its :spawn
+  option allows: a set of namespace symbols, or a predicate on sym.  With
+  no :spawn nothing is: a peer is not authenticated yet, and a spawn runs
+  any fn it names."
+  [n sym]
+  (let [allow (:spawn (state n))]
+    (boolean
+     (cond
+       (set? allow) (contains? allow (symbol (namespace sym)))
+       (ifn? allow) (allow sym)
+       :else false))))
+
 (defn handle-frame
   "Perform, as node n, the operation frame from peer asks for."
   [n peer frame]
@@ -272,14 +285,16 @@
                      (when-let [a (and id (here id))] (proc/-drop-monitor a ref)))
         :fired (let [[ref reason] args] (fire! n ref reason))
         :alias (let [[alias msg] args] (act/send-alias! alias msg))
-        :spawn (let [[ref sym fargs link from] args
-                     f (requiring-resolve sym)
-                     ;; the link is made by the new process before it runs a
-                     ;; step, so a crash at once still reaches the spawner
-                     go (promise)
-                     a (act/spawn (fn [] @go (when link (act/link! from)) (apply f fargs)))]
-                 (send-frame! n peer [:spawned ref a])
-                 (deliver go true))
+        :spawn (let [[ref sym fargs link from] args]
+                 (if-not (spawn-allowed? n sym)
+                   (send-frame! n peer [:spawned ref [:refused sym]])
+                   (let [f (requiring-resolve sym)
+                         ;; the link is made by the new process before it runs a
+                         ;; step, so a crash at once still reaches the spawner
+                         go (promise)
+                         a (act/spawn (fn [] @go (when link (act/link! from)) (apply f fargs)))]
+                     (send-frame! n peer [:spawned ref a])
+                     (deliver go true))))
         :spawned (let [[ref pid] args]
                    (when-let [p (get-in @nodes [n :pending ref])] (deliver p pid)))
         nil))))
@@ -315,17 +330,24 @@
 (defn start!
   "Start node name in this VM, reachable over transport.  Code that runs
   outside any actor now runs as this node; with-node runs code as another.
+  Options:
+
+      :spawn   what a peer may start here with spawn-on: a set of namespace
+               symbols whose fns it may name, or a predicate on the fn's
+               symbol.  Without it a peer may start nothing.
+
   Returns name."
-  [nm transport]
+  ([nm transport] (start! nm transport {}))
+  ([nm transport opts]
   (when-not (and (keyword? nm) (= nm (edn/read-string (pr-str nm))))
     (throw (ex-info (str "a node name is a keyword that reads back as itself: " (pr-str nm))
                     {:reason :badarg :node nm})))
   (swap! nodes assoc nm {:transport transport :conns {} :watching {} :exported {}
-                         :node-mons [] :pending {}})
+                         :node-mons [] :pending {} :spawn (:spawn opts)})
   (act/set-remote-resolver! (fn [[_ remote-nm peer]] (->RemoteName peer remote-nm)))
   (act/set-remote-alias-sender! (fn [alias msg]
                                   (send-frame! (act/node) (:ensemble.actor/owner-node alias) [:alias alias msg])))
-  nm)
+  nm))
 
 (defmacro with-node
   "Run body as node n: what it spawns runs there, and names resolve there."
@@ -359,8 +381,10 @@
 
 (defn spawn-on
   "Start a process on node peer running (apply f args), f named by a
-  symbol peer can resolve, as spawn(Node, M, F, A).  With {:link true} it
-  is linked to the current actor.  Returns its pid, a RemotePid."
+  symbol peer can resolve and allows (see start!'s :spawn), as
+  spawn(Node, M, F, A).  With {:link true} it is linked to the current
+  actor.  Returns its pid, a RemotePid; throws {:reason [:not-allowed
+  sym]} when peer refuses."
   ([peer f-sym args] (spawn-on peer f-sym args {}))
   ([peer f-sym args {:keys [link timeout] :or {timeout 5000}}]
    (let [n (act/node)
@@ -369,11 +393,15 @@
      (swap! nodes assoc-in [n :pending ref] p)
      (when-not (send-frame! n peer [:spawn ref f-sym (vec args) (boolean link) (act/self)])
        (throw (ex-info "cannot reach node" {:reason :noconnection :node peer})))
-     (let [r (deref p timeout ::timeout)]
+     (let [t (act/timeout-ms timeout)
+           r (if t (deref p t ::timeout) @p)]
        (swap! nodes update-in [n :pending] dissoc ref)
-       (if (= ::timeout r)
-         (throw (ex-info "spawn-on timed out" {:reason :timeout :node peer}))
-         r)))))
+       (cond
+         (= ::timeout r) (throw (ex-info "spawn-on timed out" {:reason :timeout :node peer}))
+         (and (vector? r) (= :refused (first r)))
+         (throw (ex-info "the node does not allow that spawn"
+                         {:reason [:not-allowed (second r)] :node peer}))
+         :else r)))))
 
 ;; --- the loopback transport ---------------------------------------------
 
