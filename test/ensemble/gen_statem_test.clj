@@ -228,3 +228,161 @@
     (is (eventually #(act/hibernating? m)))
     (is (= :here (gs/call! m :where)))
     (gs/stop! m)))
+
+;; --- state_functions mode ---------------------------------------------------
+
+(defrecord Light []
+  sm/Machine
+  (init [_] [:ok :off 0])
+  (terminate [_ _ _ _] nil)
+  sm/StateFunctions
+  (state-functions [_]
+    {:off (fn [type content n]
+            (case type
+              :cast [:next-state :on (inc n)]
+              [:keep-state-and-data [[:reply (second type) [:off n]]]]))
+     :on (fn [type content n]
+           (case type
+             :cast (if (= :break content) [:next-state :broken n] [:next-state :off n])
+             [:keep-state-and-data [[:reply (second type) [:on n]]]]))}))
+
+(deftest state-functions-call-the-state-s-own-fn
+  (let [m (sm/start (->Light))]
+    (is (= [:off 0] (gs/call! m :q)))
+    (gs/cast! m :flip)
+    (is (= [:on 1] (gs/call! m :q)))
+    (gs/cast! m :flip)
+    (is (= [:off 1] (gs/call! m :q)))
+    (gs/stop! m)))
+
+(deftest a-state-with-no-fn-stops-the-machine
+  (let [m (sm/start (->Light))]
+    (gs/cast! m :flip)
+    (gs/cast! m :break)
+    (gs/cast! m :flip)
+    (is (= [:undefined-state-function :broken] (act/exit-reason m 1000)))))
+
+;; --- repeat_state -------------------------------------------------------------
+
+(defrecord Repeater [log]
+  sm/Machine
+  (init [_] [:ok :s 0])
+  (handle-event [_ type content state n]
+    (swap! log conj [type content])
+    (cond
+      (= :enter type) [:keep-state-and-data]
+      (= [:cast :again] [type content]) [:repeat-state (inc n)]
+      (= [:cast :again-same] [type content]) [:repeat-state-and-data]
+      (= :cast type) [:keep-state-and-data [:postpone]]
+      :else [:keep-state-and-data [[:reply (second type) n]]]))
+  (terminate [_ _ _ _] nil))
+
+(deftest repeat-state-runs-the-enter-call-again
+  (let [log (atom [])
+        m (sm/start (->Repeater log) {:state-enter true})]
+    (gs/cast! m :held)
+    (gs/cast! m :again)
+    (is (= 1 (gs/call! m :n)))
+    (gs/cast! m :again-same)
+    (gs/call! m :n)
+    (is (= [[:enter :s] [:cast :held] [:cast :again] [:enter :s] [:cast :again-same] [:enter :s]]
+           (filterv #(not= :call (first %)) (map (fn [[t c]] [(if (vector? t) (first t) t) c]) @log)))
+        "the enter call repeats, and the postponed event is not retried: the state did not change")
+    (gs/stop! m)))
+
+;; --- timeout cancel, update and abs -----------------------------------------
+
+(defrecord Timers [log]
+  sm/Machine
+  (init [_] [:ok :s nil])
+  (handle-event [_ type content _ _]
+    (swap! log conj [type content])
+    (case content
+      :arm [:keep-state-and-data [[:generic-timeout :g 60 :first] [:state-timeout 60 :st]]]
+      :cancel [:keep-state-and-data [[:generic-timeout :g :cancel] [:state-timeout :cancel]]]
+      :update [:keep-state-and-data [[:generic-timeout :g :update :second]]]
+      :update-none [:keep-state-and-data [[:state-timeout :update :now]]]
+      :abs [:keep-state-and-data [[:generic-timeout :a (+ (act/now-ms) 40) :abs-fired {:abs true}]]]
+      [:keep-state-and-data]))
+  (terminate [_ _ _ _] nil))
+
+(defn- fired
+  "The timeouts that fired, as [kind content]: a generic one's type is
+  [:generic-timeout name]."
+  [log]
+  (into [] (comp (map (fn [[t c]] [(if (vector? t) (first t) t) c]))
+                 (filter #(contains? #{:state-timeout :generic-timeout} (first %))))
+        @log))
+
+(deftest a-cancel-stops-a-timer
+  (let [log (atom [])
+        m (sm/start (->Timers log))]
+    (gs/cast! m :arm)
+    (gs/cast! m :cancel)
+    (sleep 150)
+    (is (empty? (fired log)))
+    (gs/stop! m)))
+
+(deftest an-update-changes-the-content-but-not-the-deadline
+  (let [log (atom [])
+        m (sm/start (->Timers log))
+        t0 (act/now-ms)]
+    (gs/cast! m :arm)
+    (sleep 30)
+    (gs/cast! m :update)
+    (is (eventually #(some #{[:generic-timeout :second]} (fired log))))
+    (is (< (- (act/now-ms) t0) 85) "it fired at the first deadline, not 60ms after the update")
+    (gs/stop! m)))
+
+(deftest an-update-with-no-timer-fires-at-once
+  (let [log (atom [])
+        m (sm/start (->Timers log))]
+    (gs/cast! m :update-none)
+    (is (eventually #(some #{[:state-timeout :now]} (fired log))))
+    (gs/stop! m)))
+
+(deftest an-abs-timeout-fires-at-its-deadline
+  (let [log (atom [])
+        m (sm/start (->Timers log))]
+    (gs/cast! m :abs)
+    (is (eventually #(some #{[:generic-timeout :abs-fired]} (fired log))))
+    (gs/stop! m)))
+
+;; --- enter-loop ---------------------------------------------------------------
+
+(deftest enter-loop-makes-an-actor-a-machine
+  (let [m (act/spawn (fn [] (sm/enter-loop (->CodeLock [7] nil) {} :locked [])))]
+    (is (= :locked (gs/call! m :state?)))
+    (gs/cast! m 7)
+    (is (= :open (gs/call! m :state?)))
+    (gs/stop! m)
+    (is (= :normal (act/exit-reason m 1000)))))
+
+;; --- enter calls: repeat_state and the transition's event timeout ------------
+
+(defrecord EnterRepeat [log]
+  sm/Machine
+  (init [_] [:ok :a nil])
+  (handle-event [_ type content state _]
+    (swap! log conj [type state])
+    (cond
+      (= :enter type) [:repeat-state-and-data]
+      (= :cast type) [:next-state content nil [[:timeout 30 :quiet]]]
+      (= :timeout type) [:keep-state-and-data]
+      :else [:keep-state-and-data [[:reply (second type) state]]]))
+  (terminate [_ _ _ _] nil))
+
+(deftest an-enter-call-that-repeats-keeps-the-state
+  (let [log (atom [])
+        m (sm/start (->EnterRepeat log) {:state-enter true})]
+    (is (= :a (gs/call! m :state 1000)) "the machine survives its enter call")
+    (is (= 1 (count (filter #(= :enter (first %)) @log))) "the enter call runs once")
+    (gs/stop! m)))
+
+(deftest an-enter-call-keeps-the-transitions-event-timeout
+  (let [log (atom [])
+        m (sm/start (->EnterRepeat log) {:state-enter true})]
+    (gs/cast! m :b)
+    (sleep 150)
+    (is (some #{[:timeout :b]} @log) "the event timeout set with the transition fires")
+    (gs/stop! m)))

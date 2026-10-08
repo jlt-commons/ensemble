@@ -61,12 +61,16 @@ is removed, every other message stays where it was.
   [[:reply ref v] v]                 ; ref already bound: matches its value
   [[:add n] :when (pos? n) (add n)]  ; a guard; one that throws is false
   [[x x] :same]                      ; a repeated name must match equal values
+  [[:args h & t] (run h t)]          ; a list tail, Erlang's [H|T]
+  [{:op :put :at [x y]} (put x y)]   ; a map holding these keys, as #{k := V}
   [msg (log msg)]                    ; binds the whole message
   [:after 1000 :timeout])            ; ms, 0 polls, nil or :infinity waits forever
 ```
 
 As in Erlang, a symbol bound where the `receive` is written is not a binder:
 it matches the value it holds. That is how a reply is matched to its request.
+A map pattern's keys are values or bound names, never binders. A tuple
+pattern matches any sequential message, a list as well as a vector.
 
 ### State
 
@@ -109,7 +113,15 @@ Inside any actor, `(act/state)`, `(act/set-state! v)` and
 - A ref (`make-ref`) carries the node that made it. Wherever a timeout is
   taken, `nil` and `:infinity` both wait forever.
 - `register!` fails if the name is taken or the actor already has one, and a
-  name is released when its actor exits.
+  name is released when its actor exits. A name `[:via registry nm]` goes
+  through any `ensemble.registry/Registry`, and `[:global nm]` through
+  `ensemble.global`, wherever a name is taken.
+- `!` also sends to an alias (`alias!`), while the alias is active.
+- `process-info` gives a local actor's registered name, status
+  (`:running`, `:waiting`, `:hibernating`, `:passivated`), message queue
+  and its length, links, monitors, monitored-by, trap-exit flag, initial
+  call and ancestors; `processes` lists the node's live actors. On a pid of
+  another node, `process-info` and `alive?` are a badarg, as in Erlang.
 
 `join` and `exit-reason` wait for an actor from outside the actor world,
 such as a test or the REPL.
@@ -165,13 +177,23 @@ such as a test or the REPL.
   without one. In gen_statem, `:hibernate` is a transition action,
   `:hibernate-after` is a start option there too, and a hibernating
   machine still gets its timeouts.
+- `:name` may be `[:via registry nm]` or `[:global nm]`, and `call!` and
+  `cast!` take the same names. `multi-call` calls a locally registered name
+  on several nodes at once and answers `[replies bad-nodes]`; `abcast`
+  casts to it on each.
+- `enter-loop` makes the calling actor a server without `init`, as
+  `gen_server:enter_loop`.
+- A server implementing `FormatStatus` decides how its state shows in
+  `sys/get-status` and in terminate reports, to leave a secret out.
 
 ## gen_statem
 
-`ensemble.gen-statem` is OTP's gen_statem in handle_event_function mode. One
-callback, `(handle-event this type content state data)`, sees every event:
-`[:call from]`, `:cast`, `:info`, `:timeout`, `:state-timeout`,
-`[:generic-timeout name]`, `:internal` and `:enter`.
+`ensemble.gen-statem` is OTP's gen_statem. In handle_event_function mode
+one callback, `(handle-event this type content state data)`, sees every
+event: `[:call from]`, `:cast`, `:info`, `:timeout`, `:state-timeout`,
+`[:generic-timeout name]`, `:internal` and `:enter`. A machine that also
+implements `StateFunctions` runs in state_functions mode: `(state-functions
+this)` maps each state to a fn of `type content data`.
 
 ```clojure
 (require '[ensemble.gen-statem :as sm])
@@ -188,8 +210,9 @@ callback, `(handle-event this type content state data)`, sees every event:
   (terminate [_ _ _ _] nil))
 ```
 
-Results are `:next-state`, `:keep-state`, `:keep-state-and-data`, `:stop`
-and `:stop-and-reply`. Actions are `:postpone`, `:next-event`, `:reply`,
+Results are `:next-state`, `:keep-state`, `:keep-state-and-data`,
+`:repeat-state`, `:repeat-state-and-data` (which run the enter call again),
+`:stop` and `:stop-and-reply`. Actions are `:postpone`, `:next-event`, `:reply`,
 `:timeout` (or a bare time), `:state-timeout`, `:generic-timeout` and
 `:hibernate`. One action may stand alone where a list goes, as
 `[:keep-state-and-data [:reply from v]]`. A bad return stops the machine
@@ -198,7 +221,11 @@ of these with `[:bad-action-from-state-function a]`, the reasons OTP
 gives. A postponed event is
 retried after the next state change. Inserted events run before everything
 else. A state timeout is cancelled by a state change, and the event timeout
-by any event. `{:state-enter true}` turns on enter calls. Clients use
+by any event. Every timeout takes `:cancel` (`[:state-timeout :cancel]`)
+and `:update` (`[:generic-timeout name :update content]`, which keeps the
+running timer's deadline), and an options map `{:abs true}` makes its time
+a monotonic deadline. `{:state-enter true}` turns on enter calls, and
+`enter-loop` makes the calling actor a machine. Clients use
 `gs/call!`, `gs/cast!` and `gs/stop!`, since a gen-statem speaks the same
 protocol as a gen-server.
 
@@ -218,6 +245,19 @@ calling actor both ways, and the link goes with the actor's last handler.
 old one's `h-terminate` runs, and `(f what-it-returned)` is the new one.
 `call!` talks to one handler (`:bad-module` if there is none), and
 `delete-handler!` returns what `h-terminate` returned.
+
+## sys
+
+`ensemble.sys` looks into a running gen-server or gen-statem, and so into
+a supervisor or a gen-event manager, through system messages it answers
+between its own: `get-state`, `replace-state!`, `get-status`, `suspend!`
+and `resume!` (a suspended process takes only system messages),
+`statistics`, `trace!` (each message it takes is reported) and
+`terminate!`. A gen-statem's state there is `[state data]`.
+
+As proc_lib does, every actor records its initial call (`spawn`'s
+`:initial-call`, which the behaviours set to `[module :init]`) and its
+ancestors, and a crash report carries both.
 
 ## Supervisors
 
@@ -268,6 +308,20 @@ old one's `h-terminate` runs, and `(f what-it-returned)` is the new one.
 dependencies to be running, `ensure-all-started!` starts them first, and
 `stop!` stops the tree, then runs `:stop`.
 
+- `:env` is the application's configuration: `get-env`, `get-all-env`,
+  `set-env!` and `unset-env!`. A value set before a reload is kept.
+  `get-key` reads the loaded spec.
+- `:start-phases` `[[phase args] ...]` run in order after `:start`, each as
+  `(start-phase phase :normal args)`; one that doesn't answer `:ok` stops
+  the tree and fails the start.
+- `:prep-stop` runs before the tree stops, and `:stop` gets what it
+  returns.
+- `:optional-applications` may be absent: one not loaded is skipped.
+  `:included-applications` must be loaded, and can't be started on their
+  own while their includer runs.
+- `ensure-all-started!` stops what it started, the last first, when a
+  later start fails, as OTP 26's does.
+
 If the tree exits on its own, the type decides what happens next. A
 `:temporary` application is only recorded (see `exits`). A `:permanent` one,
 or a `:transient` one that exited abnormally, stops every other application,
@@ -283,8 +337,6 @@ event, and its state), and supervisor reports (`:child-terminated`,
 restart intensity). An orderly end is never reported, nor is an actor's
 own `(exit! reason)`. Reports print to `*err*` until `set-handler!`
 installs another handler.
-
-## Timers
 
 ## Timers
 
@@ -345,15 +397,77 @@ process or on another machine.
 - `spawn-on` starts a fn named by a symbol on the other node, as
   `spawn(Node, M, F, A)` does, if that node allows it: `start!`'s `:spawn`
   option is a set of namespaces or a predicate on the symbol, and without
-  it a node starts nothing for a peer, since peers aren't authenticated
-  yet.
-- Connections come from a `Transport`. The loopback transport joins nodes
-  in one VM, but each frame is still printed and read back as EDN, so what
-  crosses is exactly what a wire would carry. A socket transport plugs in
-  through the same protocol.
+  it a node starts nothing for a peer.
+- `monitor-nodes!` sends the calling actor `[:nodeup n]` and `[:nodedown
+  n]` for every connection of its node, as `net_kernel:monitor_nodes`.
+  `act/nodes` lists the connected nodes. `stop!` takes a node down.
 - A node name is a keyword that reads back as itself, like `:shop.host`.
   Erlang's `shop@host` doesn't work here: `@` ends a token in Clojure's
   reader, and edn rejects it.
+
+The layers, bottom up:
+
+- **Transport** (`ensemble.transport`): a byte stream between two nodes,
+  `Transport` (`-listen`, `-connect`), `Listener` and `Conn` (`-start`,
+  `-write`, `-close`). That is all a transport library implements, for TCP,
+  TLS or anything else; it resolves node names to addresses however it
+  likes. The loopback transport joins nodes in one VM, and `{:chunk n}`
+  splits its stream the way a network might.
+- **Framing and codec**: a frame is its length, four bytes big-endian,
+  then its payload, which a `Codec` (`ensemble.codec`, EDN by default,
+  `start!`'s `:codec`) turns into a value. A frame larger than `start!`'s
+  `:max-frame` (64 MB by default) drops the connection, as does one that
+  doesn't decode.
+- **Envelope**: each frame after the handshake is `[op hdr body]`. `hdr`
+  holds the operation's own fields (the pids it names, a ref, a name) and
+  `body` the data it carries, a message or an exit reason. Pids and
+  throwables in the body are tagged and data that looks like a tag is
+  escaped, so a message arrives exactly as it was sent. Sending something
+  the wire can't carry (a record, an atom, a fn) throws at the sender; a
+  throwable arrives as an `ex-info` with its message and data.
+- **Handshake**: a connection is used only after the handshake, Erlang's
+  shape: the connecting node sends its name and creation, the other answers
+  with a status (`:nok` for a name it won't take, `:alive` when it's
+  connected to that run of the node already, and of two nodes connecting
+  to each other at once only one connection survives) and a challenge, and each end proves it holds
+  the cookie by signing the other's challenge with HMAC-SHA256. `start!`'s
+  `:cookie` sets it (by default nodes in one VM share a cookie drawn at
+  startup), or `:auth` takes any `ensemble.node/Auth`. A connection that
+  hasn't shaken hands within `:handshake-timeout` is closed, and a node
+  that restarts is let in, its earlier run going down first.
+- **Creation**: each start of a node draws a creation number that its pids
+  and refs carry, so a pid of an earlier run names no process, though its
+  id may be in use again.
+
+### Services
+
+```clojure
+(require '[ensemble.rpc :as rpc] '[ensemble.global :as global] '[ensemble.pg :as pg])
+
+(rpc/call :shop.b `my.ns/total [order] 5000)    ; erpc:call
+(rpc/multicall [:shop.a :shop.b] `my.ns/stats [])
+(global/register-name :leader (act/self))        ; :yes or :no
+(gs/call! [:global :leader] :status)
+(pg/join :workers (act/self))
+(pg/get-members :workers)                        ; on every node
+```
+
+- `ensemble.rpc` is erpc: `call` runs a fn in a process of its own on the
+  node (one its `:spawn` option allows) and answers its value, or throws
+  with `:noconnection`, `:timeout` (the process is then killed),
+  `[:exception e]` or `[:exit reason]`. `cast` doesn't wait, and
+  `multicall` asks several nodes at once.
+- `ensemble.global` is global: one name table over every connected node.
+  Registering locks the name on each node, checks no node has it, and sets
+  it everywhere. A name goes when its process exits or its node goes
+  down. When nodes connect they merge tables, and a name both hold keeps
+  the process whose pid sorts first, killing the other, as global's
+  default resolve does. `[:global nm]` works wherever a name does.
+- `ensemble.pg` is pg: process groups over every connected node, joined
+  from the member's own node, kept eventually consistent as pg's are.
+  `join`, `leave`, `get-members`, `get-local-members`, `which-groups`, and
+  `monitor`, which sends `[ref :join group pids]` and `[ref :leave group
+  pids]`.
 
 ## Where this differs from Erlang
 
@@ -366,9 +480,13 @@ process or on another machine.
   bookkeeping of a dying process -- telling its links and monitors -- runs
   masked, so a late signal cannot tear it.
 - **Passivation is an extension.** Erlang's hibernation stays in memory.
-- **Distribution has only the loopback transport so far**, with no
-  cookies and no global name registry. There is also no hot code loading, no `sys` suspend/resume, and no
-  reductions (jolt preempts fibers on a timer instead).
+- **Distribution ships only the loopback transport**; a network transport
+  is a library implementing `ensemble.transport`. The cookie handshake
+  signs with HMAC-SHA256 rather than Erlang's MD5 digest, and the frames
+  are EDN, not the external term format, so ensemble nodes do not talk to
+  Erlang nodes. global and pg have the default scope only.
+- There is no hot code loading, and no reductions (jolt preempts fibers on
+  a timer instead).
 - **Reasons** are any value, and a crash's reason is the throwable itself
   rather than `{Exception, Stacktrace}`.
 - **Names** may be keywords, symbols or strings, all normalised to a keyword.
@@ -388,20 +506,21 @@ written from the Erlang/OTP documentation:
 | `ensemble.timers` | when timers fire and in what order, what a cancel answers, which timers an exit ends | `timers_spec` |
 | `ensemble.request` | which message answers an asynchronous request, alone or in a collection | `request_spec` |
 | `ensemble.life` | a process's life: running, hibernated, on disk, exited | `life_spec` |
-| `ensemble.dist` | where a send goes, what a pid in a message is on arrival, what a lost connection does | `dist_spec` |
+| `ensemble.dist` | where a send goes, what a pid in a message is on arrival, what a lost connection does, every step of the handshake, the frame header | `dist_spec` |
 | `ensemble.callback` | what a gen_server's init and callback returns mean, and their actions | `callback_spec` |
 | `ensemble.statem` | gen_statem init and results, actions, postpone order, timeouts | `statem_spec` |
 
-Every spec requires proof (`{:require :proved}`): 312 of their 322 laws
-are proved, 201 of them for every input -- among them that a selective
+Every spec requires proof (`{:require :proved}`): 342 of their 356 laws
+are proved, 223 of them for every input -- among them that a selective
 receive is the manual's, message by message and clause by clause, that a
 restart plan is the supervisor docs', that a child spec is refused for
 the reason `check_childspecs` gives, that a lost connection breaks exactly
 the links and monitors across it, and that no gen_statem event is lost
-or duplicated, over mailboxes, children and queues of any length. The 10
-left to testing each say why: they recurse over patterns of any depth,
-over a callback's list of actions, or walk a message of any shape for the
-pids in it. `test/ensemble/order_proof.clj` and
+or duplicated, over mailboxes, children and queues of any length, and
+that two nodes come up only when both hold the cookie. The 14 left to
+testing each say why: they recurse over patterns of any depth, over a
+callback's list of actions, walk a message of any shape for the pids in
+it, or shift bits, which the prover doesn't model. `test/ensemble/order_proof.clj` and
 `timers_proof.clj` hold the lemmas about clojure.core the proofs cite.
 
 A law over `Any` covers values without NaN; one over `Any!` takes NaN in

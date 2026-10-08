@@ -20,7 +20,8 @@
   if the handler is removed for any reason but delete-handler!, that actor
   receives [:gen-event-EXIT id reason]."
   (:require [ensemble.actor :as act]
-            [ensemble.gen-server :as gs]))
+            [ensemble.gen-server :as gs]
+            [ensemble.logger :as logger]))
 
 (defprotocol Handler
   (h-init [this] "Return the handler's initial state.")
@@ -38,19 +39,27 @@
 
 (defn- hdel [hs id] (filterv #(not= id (:id %)) hs))
 
+(defn- release-owner
+  "Unlink owner once hs holds no handler of its, unless the two were linked
+  before its first handler came (a start-link parent, say)."
+  [hs owner linked-before?]
+  (when (and owner (not linked-before?) (not (some #(= owner (:owner %)) hs)))
+    (act/unlink! owner)))
+
 (defn- remove-handler
   "Remove h for reason: run its terminate (a throw there is ignored, as in
-  OTP) and tell a supervising actor, unless it asked for the removal itself.
-  An owner left with no handler of its own is unlinked.  Returns [handlers
-  terminate-result]."
-  [hs h reason tell?]
-  (let [r (try (h-terminate (:handler h) reason (:st h)) (catch Throwable e [:error e]))
-        hs* (hdel hs (:id h))]
-    (when-let [owner (:owner h)]
-      (when tell? (act/! owner [:gen-event-EXIT (:id h) reason]))
-      (when-not (some #(= owner (:owner %)) hs*)
-        (act/unlink! owner)))
-    [hs* r]))
+  OTP) and tell a supervising actor, unless it asked for the removal itself
+  -- told, when given, is what it hears instead of reason.  An owner left
+  with no handler of its own is unlinked, unless release? is false.
+  Returns [handlers terminate-result]."
+  ([hs h reason tell?] (remove-handler hs h reason tell? reason true))
+  ([hs h reason tell? told release?]
+   (let [r (try (h-terminate (:handler h) reason (:st h)) (catch Throwable e [:error e]))
+         hs* (hdel hs (:id h))]
+     (when-let [owner (:owner h)]
+       (when tell? (act/! owner [:gen-event-EXIT (:id h) told]))
+       (when release? (release-owner hs* owner (:linked-before h))))
+     [hs* r])))
 
 (defn- add
   "Add handler under id, at position at (the end when nil), supervised by
@@ -60,7 +69,11 @@
     [[:error :already-added] hs]
     (let [r (try [:ok (h-init handler)] (catch Throwable e [:error (act/reason-of e)]))]
       (if (= :ok (first r))
-        (let [entry {:id id :handler handler :st (second r) :owner owner}
+        (let [linked-before (when owner
+                              (if-let [same (first (filter #(= owner (:owner %)) hs))]
+                                (:linked-before same)
+                                (contains? (act/process-info (act/self) :links) owner)))
+              entry {:id id :handler handler :st (second r) :owner owner :linked-before linked-before}
               at (or at (count hs))]
           (when owner (act/link! owner))
           [[:ok nil] (vec (concat (take at hs) [entry] (drop at hs)))])
@@ -69,14 +82,24 @@
 (defn- swap
   "Replace handler h with one made by (f terminate-result) under new-id, as
   OTP's swap_handler: h's terminate runs with reason, and what it returns
-  is the new handler's start.  The new one is supervised by owner."
+  is the new handler's start.  The new one is supervised by owner.  A
+  supervising actor of h's hears [:gen-event-EXIT id [:swapped new-id
+  owner]], as OTP's does."
   [hs h reason new-id f owner]
   (let [at (count (take-while #(not= (:id h) (:id %)) hs))
-        [hs* res] (remove-handler hs h reason false)
-        handler (try (f res) (catch Throwable e e))]
-    (if (instance? Throwable handler)
-      [[:error (act/reason-of handler)] hs*]
-      (add hs* new-id handler owner at))))
+        old-owner (:owner h)
+        [hs* res] (remove-handler hs h reason (some? old-owner) [:swapped new-id owner] false)
+        handler (try (f res) (catch Throwable e e))
+        [r hs**] (if (instance? Throwable handler)
+                   [[:error (act/reason-of handler)] hs*]
+                   (add hs* new-id handler owner at))
+        ;; the same owner keeps what it had: the link is h's, not from before
+        hs** (if (and owner (= owner old-owner))
+               (mapv #(if (= owner (:owner %)) (assoc % :linked-before (:linked-before h)) %) hs**)
+               hs**)]
+    ;; unlinked only now, so swapping to the same owner keeps the link
+    (release-owner hs** old-owner (:linked-before h))
+    [r hs**]))
 
 (defn- run-handler
   "Run (f) for handler h, a callback that answers as h-handle-event does,
@@ -90,8 +113,12 @@
            (or (= 2 (count r)) (= :hibernate (nth r 2))))
       [(mapv #(if (= (:id h) (:id %)) (assoc % :st (second r)) %) hs) (= 3 (count r))]
       (and (vector? r) (= :swap-handler (first r)) (= 5 (count r)))
-      (let [[_ reason st new-id f] r]
-        [(second (swap hs (assoc h :st st) reason new-id f (:owner h))) false])
+      (let [[_ reason st new-id f] r
+            [res hs*] (swap hs (assoc h :st st) reason new-id f (:owner h))]
+        (when-not (= :ok (first res))
+          (logger/report! {:level :error :kind :gen-event-swap-failed :manager (act/self)
+                           :handler (:id h) :new-handler new-id :reason (second res)}))
+        [hs* false])
       (and (vector? r) (= ::crash (first r)))
       [(first (remove-handler hs h [:error (act/reason-of (second r))] true)) false]
       :else [(first (remove-handler hs h [:error [:bad-return-value r]] true)) false])))

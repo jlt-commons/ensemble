@@ -113,6 +113,39 @@
     (act/! a [3 3])
     (is (= [:same 3] (act/join a 1000)))))
 
+(deftest a-list-tail-takes-the-rest
+  (let [a (act/spawn (fn [] (receive [[:args h & t] [h (vec t)]])))]
+    (act/! a [:args 1 2 3])
+    (is (= [1 [2 3]] (act/join a 1000))))
+  (let [a (act/spawn (fn [] (receive [[:one x & []] x] [_ :many])))]
+    (act/! a [:one 1 2])
+    (is (= :many (act/join a 1000)))))
+
+(deftest a-map-pattern-matches-the-keys-it-names
+  (let [a (act/spawn (fn [] [(receive [{:op :add :n n} n])
+                             (receive [{:op :put :at {:x x}} x])
+                             (receive [m m] [:after 0 nil])]))]
+    (act/! a {:op :put :at {:x 9}})
+    (act/! a [:op :add :n 1])
+    (act/! a {:op :add :n 5 :extra true})
+    (is (= [5 9 [:op :add :n 1]] (act/join a 1000)))))
+
+(deftest a-map-key-may-be-a-bound-local
+  (let [a (act/spawn (fn []
+                       (let [k (act/make-ref)]
+                         (act/! (act/self) {(act/make-ref) :wrong})
+                         (act/! (act/self) {k :right})
+                         (receive [{k v} v]))))]
+    (is (= :right (act/join a 1000)))))
+
+(deftest a-map-key-must-be-a-value
+  (is (thrown? Throwable (eval '(ensemble.actor/receive [{unbound v} v])))))
+
+(deftest a-tail-needs-one-pattern
+  (is (thrown? Throwable (eval '(ensemble.actor/receive [[a &] a]))))
+  (is (thrown? Throwable (eval '(ensemble.actor/receive [[a & b c] a]))))
+  (is (thrown? Throwable (eval '(ensemble.actor/receive [[& b] b])))))
+
 (deftest receive-outside-an-actor-throws
   (is (thrown? Throwable (receive [_ :x] [:after 0 :none]))))
 
@@ -341,3 +374,96 @@
     (is (= :one.vm (act/ref-node r1)))
     (is (= :two.vm (act/ref-node r2)))
     (is (not= (assoc r1 :ensemble.actor/ref 0) (assoc r2 :ensemble.actor/ref 0)))))
+
+;; --- process-info -----------------------------------------------------------
+
+(defn- eventually [pred]
+  (loop [i 0] (cond (pred) true (> i 200) false :else (do (a/<!! (a/timeout 10)) (recur (inc i))))))
+
+(deftest process-info-reports-the-mailbox
+  (let [a (act/spawn (fn [] (receive [:go nil]) (receive [:stop nil])) {:name ::info-box})]
+    (act/! a :x)
+    (act/! a [:y 1])
+    (is (eventually #(= :waiting (act/process-info a :status))))
+    (is (= 2 (act/process-info a :message-queue-len)))
+    (is (= [:x [:y 1]] (act/process-info a :messages)))
+    (is (= :info-box (act/process-info a :registered-name)))
+    (is (false? (act/process-info a :trap-exit)))
+    (act/! a :go)
+    (act/! a :stop)
+    (act/join a 1000)
+    (is (nil? (act/process-info a)))
+    (is (nil? (act/process-info a :messages)))))
+
+(deftest process-info-reports-links-and-monitors
+  (let [b (act/spawn (fn [] (receive [:stop nil])))
+        a (act/spawn (fn []
+                       (act/link! b)
+                       (let [r (act/monitor! b)]
+                         (receive [:stop nil])
+                         r))
+                     {:trap true})]
+    (is (eventually #(contains? (act/process-info b :links) a)))
+    (is (eventually #(= [a] (act/process-info b :monitored-by))))
+    (act/! a :stop)
+    (act/join a 1000)
+    (is (eventually #(empty? (act/process-info b :monitored-by))))
+    (is (eventually #(empty? (act/process-info b :links))))
+    (act/! b :stop)))
+
+(deftest process-info-as-a-whole
+  (let [b (act/spawn (fn [] (receive [:stop nil])))
+        a (act/spawn (fn []
+                       (act/link! b)
+                       (act/monitor! b)
+                       (receive [:report (act/process-info (act/self))]))
+                     {:trap true})]
+    (is (eventually #(seq (act/process-info b :links))))
+    (act/! a :report)
+    (let [info (act/join a 1000)]
+      (is (= #{b} (:links info)))
+      (is (= [[:process b]] (:monitors info)))
+      (is (true? (:trap-exit info)))
+      (is (= :running (:status info)))
+      (is (= 0 (:message-queue-len info))))
+    (act/! b :stop)))
+
+(deftest process-info-on-a-hibernating-actor
+  (let [a (act/spawn (fn [] (act/hibernate! (fn [] (receive [:stop nil])))))]
+    (is (eventually #(= :hibernating (act/process-info a :status))))
+    (act/! a :stop)
+    (act/join a 1000)))
+
+(deftest processes-lists-the-live-actors
+  (let [a (act/spawn (fn [] (receive [:stop nil])))]
+    (is (some #{a} (act/processes)))
+    (act/! a :stop)
+    (act/join a 1000)
+    (is (not (some #{a} (act/processes))))))
+
+(deftest a-message-to-an-alias-by-bang
+  (let [a (act/spawn (fn []
+                       (let [al (act/alias!)]
+                         (act/! al :first)
+                         (act/unalias! al)
+                         (act/! al :second)
+                         [(receive [m m] [:after 50 nil]) (receive [m m] [:after 50 nil])])))]
+    (is (= [:first nil] (act/join a 1000)))))
+
+(defrecord JustData [x])
+
+(deftest a-record-is-not-a-pid
+  (is (not (act/pid? (->JustData 1))))
+  (is (not (act/remote? (->JustData 1))))
+  (is (not (act/pid? {:a 1}))))
+
+(deftest join-and-exit-reason-take-infinity
+  (let [a (act/spawn (fn [] :done))]
+    (is (= :done (act/join a :infinity)))
+    (is (= :normal (act/exit-reason a :infinity)))
+    (is (= :normal (act/exit-reason a nil)))))
+
+(deftest a-map-pattern-passes-over-a-sorted-map-of-other-keys
+  (let [a (act/spawn (fn [] (receive [{:k v} [:matched v]] [m [:other m]])))]
+    (act/! a (sorted-map 1 :a))
+    (is (= [:other {1 :a}] (act/join a 1000)) "the actor is not crashed by the sorted map's compare")))

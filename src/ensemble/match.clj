@@ -17,6 +17,9 @@
       [:Bind s]      matches anything, binds s to the message
       [:Cons p q]    matches a non-empty sequential message whose first
                      element matches p and rest matches q
+      [:IsMap]       matches any map
+      [:Has k p q]   matches a map holding key k whose value there matches
+                     p, and which itself matches q
 
   As in Erlang, a name bound twice in one pattern must match equal values:
   [x x] matches [1 1] but not [1 2].
@@ -62,4 +65,13 @@
                   nil
                   (let [c (capture tl (rest m))]
                     (if (nil? c) nil (agree b c)))))
-              nil))))
+              nil))
+    :IsMap (if (map? m) {} nil)
+    :Has (let [[_ k vp q] p]
+           (if (and (map? m) (contains? m k))
+             (let [b (capture vp (get m k))]
+               (if (nil? b)
+                 nil
+                 (let [c (capture q m)]
+                   (if (nil? c) nil (agree b c)))))
+             nil))))

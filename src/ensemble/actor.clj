@@ -43,6 +43,7 @@
             [ensemble.life :as life]
             [ensemble.logger :as logger]
             [ensemble.process :as proc]
+            [ensemble.registry :as reg]
             [ensemble.pattern :as pattern]
             [ensemble.select :as select]
             [ensemble.signal :as sig]))
@@ -71,7 +72,9 @@
 (defn remote?
   "True when x is a handle on a process of another node."
   [x]
-  (and (record? x) (proc/process? x)))
+  ;; implementing Process itself: every map satisfies it, local actors
+  ;; being maps
+  (and (record? x) (instance? ensemble.process.Process x)))
 
 (defn pid?
   "True when x is a process handle, local or remote (Erlang's is_pid)."
@@ -99,6 +102,29 @@
   [f]
   (reset! remote-resolver f))
 
+(defonce ^:private peers-fn
+  ;; set by ensemble.node: the nodes the current node is connected to
+  (atom (fn [] [])))
+
+(defn set-peers-fn!
+  "Install how nodes finds the current node's peers."
+  [f]
+  (reset! peers-fn f))
+
+(defn nodes
+  "The nodes the current node is connected to, as Erlang's nodes/0."
+  []
+  (vec (@peers-fn)))
+
+(defonce ^:private creation-fn
+  ;; set by ensemble.node: the creation number of a node's current run
+  (atom (fn [_] 0)))
+
+(defn set-creation-fn!
+  "Install how make-ref learns its node's creation."
+  [f]
+  (reset! creation-fn f))
+
 (defmethod print-method ::actor [x ^java.io.Writer w]
   (.write w (str "#<actor " (::pid x) ">")))
 
@@ -113,9 +139,11 @@
 (defn make-ref
   "A unique reference (Erlang's make_ref), for tagging a request so its reply
   can be told apart from every other message.  It carries the node that made
-  it, so refs from two runtimes never collide."
+  it, and that node's creation, so refs from two runtimes, or two runs of
+  one node, never collide."
   []
-  {::ref (swap! counter inc) ::node (node)})
+  (let [n (node)]
+    {::ref (swap! counter inc) ::node n ::creation (@creation-fn n)}))
 
 (defn ref-node
   "The node a ref was made on."
@@ -148,15 +176,21 @@
   (not= ::closed coll))
 
 (defn alive?
-  "True until the actor has exited (Erlang's is_process_alive)."
+  "True until the local actor has exited (Erlang's is_process_alive).  A
+  process of another node is a badarg, as in Erlang."
   [actor]
-  (open? @(::links actor)))
+  (if (actor? actor)
+    (open? @(::links actor))
+    (throw (ex-info "alive? takes a local process" {:reason :badarg :process actor}))))
 
 (defn whereis
-  "The live actor registered under nm on this node, or nil."
+  "The live actor registered under nm on this node, or nil.  nm may be a
+  name in another registry, [:via r name]."
   [nm]
-  (let [a (get-in @registry [(node) (norm-name nm)])]
-    (when (and a (alive? a)) a)))
+  (if (or (reg/via? nm) (reg/global? nm))
+    (let [[_ r n] (reg/named nm)] (reg/whereis-name r n))
+    (let [a (get-in @registry [(node) (norm-name nm)])]
+      (when (and a (alive? a)) a))))
 
 (defn register!
   "Register actor under nm, so ! and whereis accept the name.  As in Erlang it
@@ -197,12 +231,15 @@
   (vec (keep (fn [[k v]] (when (alive? v) k)) (get @registry (node)))))
 
 (defn resolve-dest
-  "A process handle from a handle, a name registered on this node, or a
-  name on another, [:At name node].  Sending to a name nobody holds
-  throws, as Erlang's Name ! Msg does."
+  "A process handle from a handle, a name registered on this node, a name
+  on another, [:At name node], or a name in a registry, [:via r name].
+  Sending to a name nobody holds throws, as Erlang's Name ! Msg does."
   [dest]
   (cond
     (pid? dest) dest
+    (or (reg/via? dest) (reg/global? dest))
+    (or (whereis dest)
+        (throw (ex-info "no process registered under name" {:reason :badarg :name dest})))
     (and (vector? dest) (= :At (first dest)))
     (if (= (nth dest 2) (node))
       (resolve-dest (second dest))
@@ -237,13 +274,19 @@
     (swap! (::inbox actor) conj msg)
     (ring! actor [:Mail])))
 
+(declare send-alias!)
+
+(defn- alias-ref? [x] (and (map? x) (contains? x ::owner)))
+
 (defn !
   "Send msg to dest, a process (on this node or another), a registered
-  name, or [:At name node].  Never blocks.  Returns msg.  A message to a
-  dead process is silently dropped; a message to a name nobody holds
-  throws."
+  name, [:At name node], or an alias (see alias!).  Never blocks.  Returns
+  msg.  A message to a dead process, or to an alias no longer active, is
+  silently dropped; a message to a name nobody holds throws."
   [dest msg]
-  (proc/-deliver (resolve-dest dest) msg)
+  (if (alias-ref? dest)
+    (send-alias! dest msg)
+    (proc/-deliver (resolve-dest dest) msg))
   msg)
 
 ;; exit signals ---------------------------------------------------------
@@ -430,9 +473,15 @@
   monitor."
   [dest]
   (let [me (self)
-        obj (when-not (pid? dest) (name-object dest))
+        ;; a registry's name is looked up, as gen_server does before it
+        ;; monitors: the DOWN names the process
+        dest (reg/named dest)
+        dest (if (reg/via? dest) (or (whereis dest) dest) dest)
+        obj (when-not (or (pid? dest) (reg/via? dest)) (name-object dest))
+        obj (if (reg/via? dest) dest obj)
         actor (if obj (try (resolve-dest dest) (catch Throwable _ nil)) dest)
-        ref (make-ref)
+        ;; the watcher's pid, for the target's process-info :monitored-by
+        ref (assoc (make-ref) ::by (::pid me))
         watching (::monitoring me)
         who (or obj actor)]
     (if (nil? actor)
@@ -531,6 +580,9 @@
   (let [[links _] (swap-vals! (::links me) (constantly ::closed))
         [mons _]  (swap-vals! (::monitors me) (constantly ::closed))]
     (swap! registry update (::node me) (fn [r] (into {} (remove (fn [[_ v]] (= v me))) r)))
+    (when-let [[_ r n] (:via @(::origin me))]
+      (when-not (and (satisfies? reg/Watches r) (reg/watches-its-processes? r))
+        (try (reg/unregister-name r n) (catch Throwable _ nil))))
     (doseq [[ref target] @(::monitoring me) :when (watched? target)] (proc/-drop-monitor target ref))
     (swap! procs dissoc (::pid me))
     (doseq [other links]
@@ -578,8 +630,9 @@
                  ;; a throw the body did not catch is a crash, and is reported,
                  ;; as the emulator reports an uncaught error; an exit is not
                  (when (and (not killed) (instance? Throwable reason))
-                   (logger/report! {:level :error :kind :crash-report :pid me
-                                    :name (registered-name me) :reason reason}))
+                   (logger/report! (merge {:level :error :kind :crash-report :pid me
+                                           :name (registered-name me) :reason reason}
+                                          @(::origin me))))
                  (settle! me reason)
                  (deliver (::done me)
                           (if (sig/normal? reason)
@@ -746,6 +799,9 @@
      ::resume (atom nil)
      ::refused (atom nil)
      ::fiber (atom nil)
+     ::waiting (atom false)
+     ;; proc_lib's: {:initial-call x :ancestors [parent ...]}
+     ::origin (atom {})
      ::trapping (atom false)}
     {:type ::actor}))
 
@@ -754,10 +810,17 @@
   :normal when f returns, with reason when f calls (exit! reason), and with
   the throwable when f throws.  Options:
 
-      :name     register the actor under this name before it runs
+      :name     register the actor under this name before it runs; a
+                name [:via r nm] is registered with registry r instead,
+                and released there when the actor exits
       :link     link it to the current actor before it runs (spawn_link)
       :trap     start it trapping exits
       :state    the actor's initial state (see state)
+      :initial-call  what it was started to run, for process-info and
+                crash reports, as proc_lib records {M, F, A}
+
+  As proc_lib does, it records its ancestors: the spawning actor, then
+  that one's ancestors.
 
   A link or name set here is in place before the body's first step, so an
   immediate crash cannot slip past it."
@@ -766,10 +829,25 @@
    (let [parent (self)
          me (new-actor (swap! counter inc) (node))
          go (promise)]
+     (reset! (::origin me) {:initial-call (:initial-call opts)
+                            :ancestors (if parent (into [parent] (:ancestors @(::origin parent))) [])})
      (when trap (reset! (::trapping me) true))
      (reset! (::state me) (:state opts))
-     (when name (register! name me))
+     ;; in the process table before its name is registered: a registry may
+     ;; reach for it, a monitor from another node among others
      (swap! procs assoc (::pid me) me)
+     (try
+       (if (reg/via? (reg/named name))
+         (let [[_ r n :as via] (reg/named name)]
+           (if (reg/register-name r n me)
+             (swap! (::origin me) assoc :via via)
+             (throw (ex-info "name already registered" {:reason :badarg :name name}))))
+         (when name (register! name me)))
+       (catch Throwable e
+         ;; it never runs: anything that reached for it sees it gone
+         (settle! me :noproc)
+         (deliver (::done me) [:err e :noproc])
+         (throw e)))
      (when (and link parent)
        (swap! (::links me) conj parent)
        (swap! (::links parent) (fn [ls] (if (open? ls) (conj ls me) ls))))
@@ -812,12 +890,91 @@
   [f & args]
   (apply swap! (::state (self)) f args))
 
+;; introspection --------------------------------------------------------
+
+(defn- status-of [actor]
+  (case @(::lifecycle actor)
+    [:Hibernated] :hibernating
+    [:Passivated] :passivated
+    (if @(::waiting actor) :waiting :running)))
+
+(def ^:private info-keys
+  [:registered-name :status :message-queue-len :messages :links :monitors
+   :monitored-by :trap-exit :initial-call :ancestors])
+
+(defn- info-item [actor k]
+  (case k
+    :registered-name (registered-name actor)
+    :status (status-of actor)
+    :messages (into @(::saved actor) (remove signal?) @(::inbox actor))
+    :message-queue-len (+ (count @(::saved actor)) (count (remove signal? @(::inbox actor))))
+    :links (let [ls @(::links actor)] (if (open? ls) ls #{}))
+    :monitors (vec (for [[_ t] @(::monitoring actor) :when (watched? t)] [:process t]))
+    :monitored-by (let [ms @(::monitors actor)]
+                    (if (open? ms)
+                      (vec (keep (fn [r] (when-let [w (get @procs (::by r))]
+                                           (when (= (::node w) (::node r)) w)))
+                                 (keys ms)))
+                      []))
+    :trap-exit @(::trapping actor)
+    :initial-call (:initial-call @(::origin actor))
+    :ancestors (:ancestors @(::origin actor) [])
+    (throw (ex-info "not a process-info item" {:reason :badarg :item k}))))
+
+(defn process-info
+  "What is known of a live local actor, as Erlang's process_info: a map of
+  :registered-name, :status (:running, :waiting in a receive, :hibernating
+  or :passivated), :message-queue-len, :messages, :links, :monitors (each
+  [:process p]), :monitored-by (the local actors monitoring it) and
+  :trap-exit, and proc_lib's :initial-call and :ancestors; with k, that
+  item alone.  nil once the actor has exited.  A
+  process on another node is a badarg, as in Erlang."
+  ([actor] (process-info actor nil))
+  ([actor k]
+   (let [actor (resolve-dest actor)]
+     (when-not (actor? actor)
+       (throw (ex-info "process-info takes a local process" {:reason :badarg :process actor})))
+     (when (alive? actor)
+       (if k (info-item actor k) (into {} (map (fn [k] [k (info-item actor k)])) info-keys))))))
+
+(defn processes
+  "The live actors of this node, as Erlang's processes/0."
+  []
+  (filterv #(and (= (node) (::node %)) (alive? %)) (vals @procs)))
+
 ;; receive --------------------------------------------------------------
 
 (defn always
   "The guard of a clause with none: accepts every binding."
   [_ _]
   true)
+
+;; a map pattern looks a key up in the message, and a sorted map whose keys
+;; cannot be compared with it throws there: such a clause does not match,
+;; and the actor is not crashed by what someone sent it
+
+(defn- clause-of
+  "select/clause-of, a clause whose match throws ClassCastException
+  counting as one that does not match."
+  [pats ok? msg]
+  (try (select/clause-of pats ok? msg)
+       (catch ClassCastException _
+         (or (some (fn [k]
+                     (let [r (try (select/clause-of [(nth pats k)] (fn [_ env] (ok? k env)) msg)
+                                  (catch ClassCastException _ [:Miss]))]
+                       (when (= :Hit (first r)) [:Hit k (nth r 2)])))
+                   (range (count pats)))
+             [:Miss]))))
+
+(defn- scan-each
+  "select/scan, through clause-of: for a mailbox where it threw."
+  [msgs pats ok? start]
+  (let [n (count msgs)]
+    (loop [i start]
+      (if (< i n)
+        (let [r (clause-of pats ok? (nth msgs i))]
+          (if (= :Hit (first r)) (let [[_ k env] r] [:Take i k env]) (recur (inc i))))
+        [:None i]))))
 
 (defn- take-new!
   "Take messages off me's queue, oldest first, until one satisfies a clause:
@@ -834,11 +991,17 @@
             (if (signal? m)
               ::signal
               (do (swap! inbox pop)
-                  (let [r (select/clause-of pats ok? m)]
+                  (let [r (clause-of pats ok? m)]
                     (if (= :Hit (first r))
                       (let [[_ k env] r] [k m env])
                       (do (swap! (::saved me) conj m)
                           (recur))))))))))))
+
+(defn- waiting!
+  "Park me in (wait), marked as waiting for a message the while."
+  [me wait]
+  (reset! (::waiting me) true)
+  (try (wait) (finally (reset! (::waiting me) false))))
 
 (defn receive-match
   "Block until a message matches one of the compiled patterns pats whose guard
@@ -853,7 +1016,8 @@
      (loop [start 0]
        (drain-signals! me)
        (let [saved @(::saved me)
-             r (select/scan saved pats ok? start)]
+             r (try (select/scan saved pats ok? start)
+                    (catch ClassCastException _ (scan-each saved pats ok? start)))]
          (if (= :Take (first r))
            (let [[_ i k env] r]
              ;; an emptied subvec is let go, not kept to grow on
@@ -869,9 +1033,9 @@
                  (if deadline
                    (let [left (- deadline (now-ms))]
                      (if (pos? left)
-                       (do (a/alts!! [(::bell me) (a/timeout left)]) (recur scanned))
+                       (do (waiting! me #(a/alts!! [(::bell me) (a/timeout left)])) (recur scanned))
                        [:timeout]))
-                   (do (a/<!! (::bell me)) (recur scanned))))))))))))
+                   (do (waiting! me #(a/<!! (::bell me))) (recur scanned))))))))))))
 
 (defn- guard-fn
   "The ok? fn for a receive's clauses: each guard evaluated with its clause's
@@ -898,14 +1062,19 @@
   (cond
     (and (vector? p) (= :Pin (first p))) `[:Lit ~(second p)]
     (and (vector? p) (= :Cons (first p))) `[:Cons ~(pinned-pattern (nth p 1)) ~(pinned-pattern (nth p 2))]
+    ;; a symbol key is a bound name (pattern-error refuses any other)
+    (and (vector? p) (= :Has (first p)))
+    (let [k (nth p 1)]
+      `[:Has ~(if (symbol? k) k `(quote ~k)) ~(pinned-pattern (nth p 2)) ~(pinned-pattern (nth p 3))])
     :else `(quote ~p)))
 
 (defmacro receive
   "Selective receive over the current actor's mailbox.
 
   Each clause is [pattern & body], or [pattern :when guard & body].  A pattern
-  is a tuple [:tag x ...], a symbol (binds the message), _ (wildcard) or a
-  literal.  A symbol already bound where the receive is written matches its
+  is a tuple [:tag x ...], a tuple with a tail [h & t], a map {:k p ...}
+  (holding at least those keys), a symbol (binds the message), _ (wildcard)
+  or a literal; see ensemble.pattern.  A symbol already bound where the receive is written matches its
   value instead of binding (Erlang's rule), and a name repeated in a pattern
   must match equal values.  The guard sees the clause's bindings; a message
   whose guard is false or throws is left for another clause.  Two special
@@ -924,6 +1093,8 @@
                            (= pat :after) {:kind :after :timeout (first more) :body (rest more)}
                            :else
                            (let [pat (if (= pat :else) '_ pat)
+                                 _ (when-let [e (pattern/pattern-error pat pinned)]
+                                     (throw (ex-info e {:pattern pat})))
                                  [guard body] (if (= :when (first more))
                                                 [(second more) (drop 2 more)]
                                                 [nil more])]
@@ -951,23 +1122,25 @@
 
 (defn join
   "Block until actor exits.  Return its body's value on a :normal exit;
-  otherwise rethrow what it died by.  With timeout-ms, throw if it is still
-  running then.  Not an Erlang operation: it is for code outside the actor
-  world, a test or a REPL, to wait on one."
+  otherwise rethrow what it died by.  With ms (nil or :infinity: none),
+  throw if it is still running then.  Not an Erlang operation: it is for
+  code outside the actor world, a test or a REPL, to wait on one."
   ([actor] (outcome @(::done actor)))
-  ([actor timeout-ms]
-   (let [r (deref (::done actor) timeout-ms ::timeout)]
+  ([actor ms]
+   (let [t (timeout-ms ms)
+         r (if t (deref (::done actor) t ::timeout) @(::done actor))]
      (if (= ::timeout r)
-       (throw (ex-info "join timed out" {:timeout-ms timeout-ms}))
+       (throw (ex-info "join timed out" {:timeout-ms ms}))
        (outcome r)))))
 
 (defn exit-reason
   "Block until actor exits and return its exit reason: :normal, the reason it
-  exited with, or the throwable it died by.  With timeout-ms, nil if it is
-  still running then."
+  exited with, or the throwable it died by.  With ms (nil or :infinity:
+  none), nil if it is still running then."
   ([actor] (let [[tag _ reason] @(::done actor)] (if (= :ok tag) :normal reason)))
-  ([actor timeout-ms]
-   (let [r (deref (::done actor) timeout-ms ::timeout)]
+  ([actor ms]
+   (let [t (timeout-ms ms)
+         r (if t (deref (::done actor) t ::timeout) @(::done actor))]
      (when-not (= ::timeout r)
        (let [[tag _ reason] r] (if (= :ok tag) :normal reason))))))
 

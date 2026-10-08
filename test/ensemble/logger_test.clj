@@ -122,3 +122,15 @@
       (let [a (act/spawn (fn [] (throw (ex-info "crash" {}))))]
         (is (instance? Throwable (act/exit-reason a 1000))))
       (finally (log/set-handler! old)))))
+
+(defn- stubborn [_]
+  ;; ignores :shutdown, so it is killed when its shutdown time is up
+  (act/spawn-link (fn [] (act/trap-exit! true) (receive [:never nil]))))
+
+(deftest a-simple-one-for-one-supervisor-reports-a-child-it-had-to-kill
+  (capturing rs
+    (let [s (sup/start {:strategy :simple-one-for-one} [{:id :tpl :start stubborn :shutdown 50}])]
+      (sup/start-child! s [1])
+      (sup/stop! s)
+      (is (eventually #(some (fn [r] (= :shutdown-error (:context r))) (of-kind rs :supervisor-report))))
+      (is (= :killed (:reason (first (filter #(= :shutdown-error (:context %)) (of-kind rs :supervisor-report)))))))))
