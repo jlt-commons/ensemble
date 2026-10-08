@@ -23,8 +23,9 @@
   -- in a receive, in a long computation, parked on a channel of its own --
   as an Erlang process does.  The rest wait in the queue, and are acted on
   whenever the actor enters or wakes in a receive.
-  A kill cannot be caught for good: an actor whose body swallows it dies of
-  it at its next receive, or as its body returns.
+  An exit signal is not an exception: no catch in the body can stop one the
+  actor must die of (jolt.fibers/kill!).  exit/1, an actor exiting itself,
+  is a throw, and a catch may stop it, as in Erlang.
 
   An actor is a map; treat it as opaque.  Two actors are equal when they are
   the same process.  It prints as #<actor pid>.
@@ -243,17 +244,30 @@
 
 (defn- kill!
   "Make actor die of reason now, wherever it is: claim its death once, then
-  interrupt its fiber.  The claim is what a swallowed interrupt is checked
-  against later."
+  kill its fiber (jolt.fibers/kill!), which no catch in its body can stop:
+  the body is left, running only its finally blocks, and the actor exits
+  with reason.  An exit signal is not an exception, in Erlang or here."
   [actor reason]
   (let [[old _] (swap-vals! (::life actor) (fn [l] (if (= :live l) [:dying reason] l)))]
     (when (= :live old)
-      (when-let [f @(::fiber actor)] (fib/interrupt! f (exit-ex reason))))))
+      (when-let [f @(::fiber actor)] (fib/kill! f (exit-ex reason))))))
 
 (defn- dying-of
   "The reason actor was killed with, or nil."
   [actor]
   (let [l @(::life actor)] (when (vector? l) (second l))))
+
+(defn- die-now!
+  "The current actor dies of reason, past any catch of its own: its fiber is
+  killed and reaches a safe point at once.  Off its fiber (masked, so the kill
+  waits), it throws instead."
+  [actor reason]
+  (kill! actor reason)
+  (when-let [f (fib/current-fiber)]
+    ;; a kill that came before the fiber was recorded is not on it yet
+    (fib/kill! f (exit-ex (or (dying-of actor) reason)))
+    (fib/yield))
+  (throw (exit-ex (or (dying-of actor) reason))))
 
 (defn- signal!
   "Queue an exit signal at actor and wake it.  When the signal kills it --
@@ -284,7 +298,7 @@
       (swap! (::links actor) (fn [ls] (if (open? ls) (disj ls from) ls))))
     (let [act (sig/on-signal @(::trapping actor) kind reason (= from actor))]
       (case (first act)
-        :Die     (throw (exit-ex (second act)))
+        :Die     (die-now! actor (second act))
         :Deliver [:EXIT from (second act)]
         :Ignore  nil))))
 
@@ -294,7 +308,7 @@
   An actor already killed dies here, even if its body caught the kill."
   [actor]
   (when-let [reason (dying-of actor)]
-    (throw (exit-ex reason)))
+    (die-now! actor reason))
   (when (pos? @(::signals actor))
     (let [inbox (::inbox actor)
           ss (filterv signal? @inbox)
@@ -513,7 +527,10 @@
                        (if-let [h (and (not (dying-of me)) (hibernation e))] {:hibernate h} {:err e})))]
              (if-let [h (:hibernate r)]
                (park! me (:resume h) (:disk? h))
-               (let [killed (dying-of me)
+               ;; the body is over: a signal from now on is too late, and is
+               ;; not acted on while the links and monitors are told
+               (let [[life _] (swap-vals! (::life me) (fn [l] (if (= :live l) :exited l)))
+                     killed (when (vector? life) (second life))
                      reason (cond killed killed
                                   (contains? r :ok) :normal
                                   :else (reason-of (:err r)))]

@@ -16,8 +16,9 @@ Not published yet, so point at the git repo:
          :git/sha "PUT-A-SHA-HERE"}}}
 ```
 
-It needs a jolt with fiber interrupts (`jolt.fibers/interrupt!`, merged in
-jolt-lang/jolt#1165): 0.8.15 or later.
+It needs a jolt with fiber kills (`jolt.fibers/kill!`), which no `catch`
+can stop: the nightly build (`install --version nightly`) until a release
+after 0.8.19 has them. CI runs against the nightly.
 
 ## Processes
 
@@ -181,7 +182,12 @@ callback, `(handle-event this type content state data)`, sees every event:
 
 Results are `:next-state`, `:keep-state`, `:keep-state-and-data`, `:stop`
 and `:stop-and-reply`. Actions are `:postpone`, `:next-event`, `:reply`,
-`:timeout`, `:state-timeout` and `:generic-timeout`. A postponed event is
+`:timeout` (or a bare time), `:state-timeout`, `:generic-timeout` and
+`:hibernate`. One action may stand alone where a list goes, as
+`[:keep-state-and-data [:reply from v]]`. A bad return stops the machine
+with `[:bad-return-from-state-function ret]`, and an action that is none
+of these with `[:bad-action-from-state-function a]`, the reasons OTP
+gives. A postponed event is
 retried after the next state change. Inserted events run before everything
 else. A state timeout is cancelled by a state change, and the event timeout
 by any event. `{:state-enter true}` turns on enter calls. Clients use
@@ -321,11 +327,13 @@ process or on another machine.
 ## Where this differs from Erlang
 
 - **Exit signals land wherever the process is**, through jolt's fiber
-  interrupts (`jolt.fibers/interrupt!`): a process in a long computation,
-  or parked on a core.async channel of its own, dies at once, and a `kill`
-  it catches still kills it at its next receive. The bookkeeping of a dying
-  process -- telling its links and monitors -- runs masked, so a late
-  signal cannot tear it.
+  kills (`jolt.fibers/kill!`): a process in a long computation, or parked
+  on a core.async channel of its own, dies at once. As in Erlang a signal
+  is not an exception, so no `catch` in the body stops it; unlike Erlang,
+  the body's `finally` blocks run on the way out. `(exit! reason)`, a
+  process exiting itself, is a throw it may catch, as `exit/1` is. The
+  bookkeeping of a dying process -- telling its links and monitors -- runs
+  masked, so a late signal cannot tear it.
 - **Passivation is an extension.** Erlang's hibernation stays in memory.
 - **Distribution has only the loopback transport so far**, with no
   cookies and no global name registry. There is also no hot code loading, no `sys` suspend/resume, and no
