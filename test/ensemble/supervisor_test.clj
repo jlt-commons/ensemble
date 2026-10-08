@@ -405,3 +405,15 @@
     (is (eventually #(= [{:id :c :actor nil :type :worker :restart :permanent}] (sup/which-children s))))
     (is (act/alive? s))
     (sup/stop! s)))
+
+(deftest a-child-that-catches-everything-is-still-killed
+  (let [sup (sup/start {} [{:id :stubborn :shutdown 50
+                            ;; traps, so :shutdown is a message it ignores; only
+                            ;; the kill after the shutdown time can end it
+                            :start #(act/spawn-link
+                                     (fn [] (loop [] (try (receive [_ nil]) (catch Throwable _ nil)) (recur)))
+                                     {:trap true})}])
+        c (sup/child sup :stubborn)
+        p (future (sup/terminate-child! sup :stubborn))]
+    (is (= :ok (deref p 2000 :hung)))
+    (is (= :killed (act/exit-reason c 1000)))))

@@ -16,8 +16,8 @@ Not published yet, so point at the git repo:
          :git/sha "PUT-A-SHA-HERE"}}}
 ```
 
-It needs a jolt with fiber interrupts (`jolt.fibers/interrupt!`, merged in
-jolt-lang/jolt#1165): 0.8.15 or later.
+It needs a jolt with fiber kills (`jolt.fibers/kill!`), which no `catch`
+can stop: a release after 0.8.19.
 
 ## Processes
 
@@ -326,11 +326,13 @@ process or on another machine.
 ## Where this differs from Erlang
 
 - **Exit signals land wherever the process is**, through jolt's fiber
-  interrupts (`jolt.fibers/interrupt!`): a process in a long computation,
-  or parked on a core.async channel of its own, dies at once, and a `kill`
-  it catches still kills it at its next receive. The bookkeeping of a dying
-  process -- telling its links and monitors -- runs masked, so a late
-  signal cannot tear it.
+  kills (`jolt.fibers/kill!`): a process in a long computation, or parked
+  on a core.async channel of its own, dies at once. As in Erlang a signal
+  is not an exception, so no `catch` in the body stops it; unlike Erlang,
+  the body's `finally` blocks run on the way out. `(exit! reason)`, a
+  process exiting itself, is a throw it may catch, as `exit/1` is. The
+  bookkeeping of a dying process -- telling its links and monitors -- runs
+  masked, so a late signal cannot tear it.
 - **Passivation is an extension.** Erlang's hibernation stays in memory.
 - **Distribution has only the loopback transport so far**, with no
   cookies and no global name registry. There is also no hot code loading, no `sys` suspend/resume, and no

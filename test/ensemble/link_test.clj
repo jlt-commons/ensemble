@@ -204,10 +204,11 @@
   ;; in Erlang: the [:EXIT] of an exit! comes before a message sent after it,
   ;; even when the receiver was not in a receive as both arrived
   (let [go (promise)
+        ;; trapping from the start: s may signal before r has run a step
         r (act/spawn (fn []
-                       (act/trap-exit!)
                        @go
-                       [(receive [m m]) (receive [m m])]))
+                       [(receive [m m]) (receive [m m])])
+                     {:trap true})
         s (act/spawn (fn []
                        (act/exit! r :hello)
                        (act/! r :ping)
@@ -215,3 +216,40 @@
                        (receive [:never nil])))]
     (is (= [[:EXIT s :hello] :ping] (act/join r 1000)))
     (act/exit! s :kill)))
+
+;; --- an exit signal is not an exception: no catch keeps an actor alive -----
+
+(defn- swallower
+  "An actor that catches everything, in a loop, with or without a receive."
+  [receives?]
+  (act/spawn (fn [] (loop []
+                      (try (if receives? (receive [_ nil]) (reduce + (range 1000)))
+                           (catch Throwable _ nil))
+                      (recur)))))
+
+(deftest a-kill-ends-an-actor-that-catches-everything
+  (let [a (swallower false)]
+    (sleep 20)
+    (act/exit! a :kill)
+    (is (= :killed (act/exit-reason a 1000))))
+  (let [a (swallower true)]
+    (sleep 20)
+    (act/exit! a :kill)
+    (is (= :killed (act/exit-reason a 1000)))))
+
+(deftest a-link-signal-ends-an-actor-that-catches-everything
+  (let [a (swallower true)
+        p (promise)
+        b (act/spawn (fn [] (linked! a p) (receive [:die (act/exit! :boom)])))]
+    (is (ready? p))
+    (act/! b :die)
+    (is (= :boom (act/exit-reason a 1000)))))
+
+(deftest an-exit-signal-sent-to-itself-cannot-be-caught
+  (let [a (act/spawn (fn [] (try (act/exit! (act/self) :gone) (catch Throwable _ nil))
+                       (loop [] (try (receive [_ nil]) (catch Throwable _ nil)) (recur))))]
+    (is (= :gone (act/exit-reason a 1000)))))
+
+(deftest exit-of-its-own-is-still-a-throw-it-may-catch
+  (let [a (act/spawn (fn [] (try (act/exit! :oops) (catch Throwable _ :caught))))]
+    (is (= :caught (act/join a 1000)))))
