@@ -114,6 +114,15 @@
   []
   (vec (@peers-fn)))
 
+(defonce ^:private creation-fn
+  ;; set by ensemble.node: the creation number of a node's current run
+  (atom (fn [_] 0)))
+
+(defn set-creation-fn!
+  "Install how make-ref learns its node's creation."
+  [f]
+  (reset! creation-fn f))
+
 (defmethod print-method ::actor [x ^java.io.Writer w]
   (.write w (str "#<actor " (::pid x) ">")))
 
@@ -128,9 +137,11 @@
 (defn make-ref
   "A unique reference (Erlang's make_ref), for tagging a request so its reply
   can be told apart from every other message.  It carries the node that made
-  it, so refs from two runtimes never collide."
+  it, and that node's creation, so refs from two runtimes, or two runs of
+  one node, never collide."
   []
-  {::ref (swap! counter inc) ::node (node)})
+  (let [n (node)]
+    {::ref (swap! counter inc) ::node n ::creation (@creation-fn n)}))
 
 (defn ref-node
   "The node a ref was made on."

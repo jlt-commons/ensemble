@@ -98,7 +98,7 @@
     (node/with-node a
       (act/spawn (fn []
                    (act/trap-exit!)
-                   (act/link! (node/->RemotePid b 999999))
+                   (act/link! (node/->RemotePid b 999999 (node/creation b)))
                    (deliver got (receive [[:EXIT _ reason] reason] [:after 2000 :timeout])))))
     (is (= :noproc (deref got 3000 nil)))))
 
@@ -192,3 +192,67 @@
     (is (= :abcast (node/with-node a (gs/abcast [a b] :svc :hello))))
     (is (eventually #(= :hello (node/with-node a (sys/get-state sa)))))
     (is (eventually #(= :hello (node/with-node b (sys/get-state sb)))))))
+
+;; --- the handshake, framing and creation ---------------------------------------
+
+(defn- fresh-node [& [opts transport]]
+  (let [n (keyword (str (gensym "n") ".vm"))]
+    (node/start! n (or transport (node/loopback)) (merge {:spawn #{'ensemble.node-test}} opts))
+    n))
+
+(deftest a-peer-with-the-wrong-cookie-cannot-connect
+  (let [a (fresh-node {:cookie "one"})
+        b (fresh-node {:cookie "two"})]
+    (is (false? (node/with-node a (node/connect! b))))
+    (is (= [] (node/with-node a (node/connected))))
+    (is (= [] (node/with-node b (node/connected))))
+    (is (= :noconnection
+           (try (node/with-node a (node/spawn-on b `idle [])) (catch Throwable e (:reason (ex-data e)))))
+        "an unauthenticated peer cannot spawn")))
+
+(deftest the-same-cookie-connects
+  (let [a (fresh-node {:cookie "shared"})
+        b (fresh-node {:cookie "shared"})]
+    (is (true? (node/with-node a (node/connect! b))))
+    (is (= [b] (node/with-node a (node/connected))))
+    (is (eventually #(= [a] (node/with-node b (node/connected)))))))
+
+(deftest frames-survive-a-stream-split-anywhere
+  (let [a (fresh-node {} (node/loopback {:chunk 3}))
+        b (fresh-node {} (node/loopback {:chunk 3}))
+        e (node/with-node a (node/spawn-on b `echo []))]
+    (is (= [:echo (apply str (repeat 500 "x"))] (ask a e (apply str (repeat 500 "x")))))
+    (is (= [:echo {:k [1 2 {:z #{3}}]}] (ask a e {:k [1 2 {:z #{3}}]})))))
+
+(deftest a-pid-of-an-earlier-run-names-no-process
+  (let [[a b] (two-nodes)
+        e (node/with-node a (node/spawn-on b `echo []))
+        stale (node/->RemotePid b (:id e) (inc (node/creation b)))]
+    (is (= :timeout (ask a stale :hi)) "the id is in use, but not by that run")
+    (is (= [:echo :hi] (ask a e :hi)))))
+
+(deftest two-nodes-connecting-at-once-share-one-connection
+  (dotimes [_ 5]
+    (let [a (fresh-node)
+          b (fresh-node)
+          ra (future (node/with-node a (node/connect! b)))
+          rb (future (node/with-node b (node/connect! a)))]
+      (is (true? @ra))
+      (is (true? @rb))
+      (is (= [b] (node/with-node a (node/connected))))
+      (is (= [a] (node/with-node b (node/connected)))))))
+
+(deftest a-stopped-node-goes-down-for-its-peers
+  (let [[a b] (two-nodes)
+        got (promise)]
+    (node/with-node a
+      (act/spawn (fn [] (node/monitor-node! b)
+                   (deliver got (receive [m m] [:after 2000 :timeout])))))
+    (sleep 20)
+    (node/stop! b)
+    (is (= [:nodedown b] (deref got 3000 nil)))
+    (is (false? (node/with-node a (node/connect! b))))))
+
+(deftest refs-carry-their-nodes-creation
+  (let [a (fresh-node)]
+    (is (= (node/creation a) (:ensemble.actor/creation (node/with-node a (act/make-ref)))))))
