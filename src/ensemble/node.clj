@@ -456,12 +456,25 @@
         (finally
           (swap! nodes update-in [n :connecting] dissoc peer))))))
 
+(def ^:dynamic *connect*
+  "Whether a send to a node with no connection opens one.  False within
+  without-connecting."
+  true)
+
+(defmacro without-connecting
+  "Run body with sends to a node that is not connected dropped instead of
+  connecting to it, as erlang:send/3's noconnect: for a service's own
+  traffic, which must not bring back a node that just went down."
+  [& body]
+  `(binding [*connect* false] ~@body))
+
 (defn- conn-to
   "The connection from n to peer, opened on first use as Erlang connects
-  nodes on first contact; nil when peer cannot be reached or refuses."
+  nodes on first contact, unless *connect* is false; nil when peer cannot
+  be reached or refuses."
   [n peer]
   (or (get-in @nodes [n :conns peer :conn])
-      (when (and (state n) (not= n peer)) (open! n peer))))
+      (when (and *connect* (state n) (not= n peer)) (open! n peer))))
 
 (defn- accept!
   "Take a connection opened to node n: it shakes hands before anything

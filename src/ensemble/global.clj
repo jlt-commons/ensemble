@@ -97,7 +97,8 @@
           (let [nm (some (fn [[n [_ r]]] (when (= r mref) n)) (:locks st))]
             [:noreply (if nm (update st :locks dissoc nm) st)])))
       (and (vector? msg) (= :nodeup (first msg)))
-      (do (gs/cast! [:At ::registrar (second msg)] [:sync (vec (table))])
+      ;; the peer may be down again by now: the sync must not reconnect it
+      (do (node/without-connecting (gs/cast! [:At ::registrar (second msg)] [:sync (vec (table))]))
           [:noreply st])
       (and (vector? msg) (= :nodedown (first msg)))
       (let [peer (second msg)]
