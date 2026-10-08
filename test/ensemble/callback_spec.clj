@@ -56,8 +56,11 @@
   {:states {:ret Any, :reply Replies, :noreply NoReplies, :stop Stops, :bad Bad}
    :edges  {:ret {[interpret Kind _] #{:reply :noreply :stop :bad}}}
    ;; a reply is a handle-call's alone: generated returns rarely pair one
-   ;; with :call
-   :witnesses {[:ret :reply] [[:reply 1 2] :call]}})
+   ;; with :call.  A generated return is seldom a [:noreply state] or a
+   ;; [:stop reason state] either
+   :witnesses {[:ret :reply] [[:reply 1 2] :call]
+               [:ret :noreply] [[:noreply 1] :other]
+               [:ret :stop] [[:stop :done 1] :other]}})
 
 (refine Starts  [i Init] (= :Start (first i)))
 (refine Ignores [i Init] (= :Ignore (first i)))
