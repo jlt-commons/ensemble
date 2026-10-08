@@ -5,7 +5,8 @@
             [clojure.test :refer [deftest is testing]]
             [ensemble.actor :as act :refer [receive]]
             [ensemble.gen-server :as gs]
-            [ensemble.node :as node]))
+            [ensemble.node :as node]
+            [ensemble.sys :as sys]))
 
 (defn- sleep [ms] (a/<!! (a/timeout ms)))
 
@@ -161,3 +162,33 @@
     (is (= [:not-allowed `echo]
            (try (node/with-node b (node/spawn-on a `echo [])) (catch Throwable e (:reason (ex-data e))))))
     (is (act/pid? (node/with-node a (node/spawn-on b `idle []))))))
+
+;; --- multi_call and abcast ------------------------------------------------------
+
+(defrecord Named []
+  gs/Server
+  (init [_] [:ok nil])
+  (handle-call [_ req _ st] [:reply [(act/node) req] st])
+  (handle-cast [_ req _] [:noreply req])
+  (handle-info [_ _ st] [:noreply st])
+  (handle-timeout [_ st] [:noreply st])
+  (handle-continue [_ _ st] [:noreply st])
+  (terminate [_ _ _] nil))
+
+(deftest multi-call-asks-the-name-on-each-node
+  (let [[a b] (two-nodes)
+        c (keyword (str (gensym "c") ".vm"))]
+    (node/with-node a (gs/start (->Named) {:name :svc}))
+    (node/with-node b (gs/start (->Named) {:name :svc}))
+    (let [[replies bad] (node/with-node a (gs/multi-call [a b c] :svc :q 2000))]
+      (is (= #{[a [a :q]] [b [b :q]]} (set replies)))
+      (is (= [c] bad) "a node that cannot be reached is bad"))
+    (is (= #{a b} (set (map first (first (node/with-node a (gs/multi-call :svc :q)))))) "by default, this node and its peers")))
+
+(deftest abcast-casts-the-name-on-each-node
+  (let [[a b] (two-nodes)
+        sa (node/with-node a (gs/start (->Named) {:name :svc}))
+        sb (node/with-node b (gs/start (->Named) {:name :svc}))]
+    (is (= :abcast (node/with-node a (gs/abcast [a b] :svc :hello))))
+    (is (eventually #(= :hello (node/with-node a (sys/get-state sa)))))
+    (is (eventually #(= :hello (node/with-node b (sys/get-state sb)))))))

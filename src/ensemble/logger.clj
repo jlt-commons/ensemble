@@ -2,7 +2,8 @@
   "Reports, as OTP's logger receives them from the runtime and the
   behaviours.  A report is a map with a :level and a :kind:
 
-      :crash-report           an actor's body threw: :pid, :name, :reason
+      :crash-report           an actor's body threw: :pid, :name, :reason,
+                              :initial-call, :ancestors
       :gen-server-terminate   a gen-server stopped abnormally: :server,
                               :name, :last-message, :state, :reason
       :gen-statem-terminate   the same for a gen-statem, with :last-event,

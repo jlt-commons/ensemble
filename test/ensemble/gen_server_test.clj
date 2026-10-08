@@ -2,7 +2,8 @@
   (:require [clojure.core.async :as a]
             [clojure.test :refer [deftest is testing]]
             [ensemble.actor :as act :refer [receive]]
-            [ensemble.gen-server :as gs]))
+            [ensemble.gen-server :as gs]
+            [ensemble.registry :as reg]))
 
 (defn- sleep [ms] (a/<!! (a/timeout ms)))
 
@@ -441,3 +442,50 @@
   (let [s (gs/start (->SlowInit 0))
         a (act/spawn (fn [] (gs/wait-response (gs/send-request s :get) :infinity)))]
     (is (= [:reply :up] (act/join a 1000)))))
+
+;; --- names through a registry ({via, Module, Name}) -------------------------
+
+(defrecord MapRegistry [names]
+  reg/Registry
+  (register-name [_ nm pid]
+    (let [[old _] (swap-vals! names (fn [m] (if (contains? m nm) m (assoc m nm pid))))]
+      (not (contains? old nm))))
+  (unregister-name [_ nm] (swap! names dissoc nm) nil)
+  (whereis-name [_ nm] (get @names nm)))
+
+(deftest a-server-named-through-a-registry
+  (let [r (->MapRegistry (atom {}))
+        s (gs/start (->Counter nil) {:name [:via r :counter]})]
+    (is (= s (reg/whereis-name r :counter)))
+    (is (= 3 (gs/call! [:via r :counter] [:add 3])))
+    (gs/cast! [:via r :counter] [:tick])
+    (is (= 4 (gs/call! [:via r :counter] [:get])))
+    (is (= [:already-started s]
+           (reason-of-failure #(gs/start (->Counter nil) {:name [:via r :counter]}))))
+    (gs/stop! [:via r :counter])
+    (is (nil? (reg/whereis-name r :counter)) "the name goes when the server exits")
+    (is (= :noproc (reason-of-failure #(gs/call! [:via r :counter] [:get]))))))
+
+(deftest sending-to-a-registry-name
+  (let [r (->MapRegistry (atom {}))
+        a (act/spawn (fn [] (receive [m m])) {:name [:via r :box]})]
+    (act/! [:via r :box] :hello)
+    (is (= :hello (act/join a 1000)))
+    (is (thrown? Throwable (act/! [:via r :nobody] :x)))))
+
+;; --- enter-loop -----------------------------------------------------------------
+
+(deftest enter-loop-makes-an-actor-a-server
+  (let [s (act/spawn (fn [] (gs/enter-loop (->Counter nil) {} 41)))]
+    (is (= 42 (gs/call! s [:add 1])))
+    (gs/stop! s)
+    (is (= :normal (act/exit-reason s 1000)))))
+
+(deftest enter-loop-with-a-name-wants-it-registered
+  (let [s (act/spawn (fn [] (gs/enter-loop (->Counter nil) {:name ::not-mine} 0)))]
+    (is (= :process-not-registered (act/exit-reason s 1000))))
+  (let [s (act/spawn (fn [] (act/register! ::mine (act/self))
+                       (gs/enter-loop (->Counter nil) {:name ::mine} 0)))]
+    (loop [i 0] (when (and (nil? (act/whereis ::mine)) (< i 100)) (sleep 5) (recur (inc i))))
+    (is (= 0 (gs/call! ::mine [:get])))
+    (gs/stop! s)))

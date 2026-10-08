@@ -24,7 +24,8 @@
   With {:state-enter true}, the machine is also called with type :enter,
   content the old state, on its first state and after every state change.
 
-  Clients use ensemble.gen-server's call!, cast! and stop!: a gen-statem
+  Clients use ensemble.gen-server's call!, cast! and stop!, and
+  ensemble.sys, whose state of a machine is [state data]: a gen-statem
   speaks the same protocol, so a call's reply, a dead machine's :noproc and a
   timeout behave exactly as for a gen-server.  Answer a call with a
   [:reply from value] action or with reply!."
@@ -74,17 +75,17 @@
   (let [reason (try (terminate m reason (:state st) (:data st)) reason
                     (catch Throwable e (act/reason-of e)))]
     (when-not (sig/shutdown? reason)
-      (let [[type content] event]
+      (let [[type content] event
+            shown (gs/formatted m {:state (:state st) :data (:data st) :reason reason
+                                   :message [(if (vector? type) (first type) type) content]})]
         (logger/report! {:level :error :kind :gen-statem-terminate :server (act/self)
                          :name (act/registered-name (act/self))
-                         :last-event [(if (vector? type) (first type) type) content]
-                         :state (:state st) :data (:data st) :reason reason})))
+                         :last-event (:message shown)
+                         :state (:state shown) :data (:data shown) :reason (:reason shown)})))
     (act/exit! reason)))
 
-(defn- next-event-of
-  "Wait for the next external event, or the earliest timer.  Returns
-  [event st]; a timer that fires is removed.  With idle ms and no timer
-  due sooner, [[:idle] st] when that long passes with no event."
+(defn- next-unsuspended
+  "next-event-of, for a machine that is not suspended."
   [parent st idle]
   (let [[k [deadline content]] (first (sort-by (comp first val) (:deadlines st)))
         timer-wait (when k (max 0 (- deadline (now))))
@@ -94,20 +95,31 @@
            [[::gs/call from request] [:event [[:call from] request]]]
            [[::gs/cast request] [:event [:cast request]]]
            [[::gs/stop reason] [:stop reason]]
+           [[::gs/system from req] [:system from req]]
            [[:EXIT from reason] :when (and (some? parent) (= from parent)) [:stop reason]]
            [[::wake] [:wake]]
            [:after wait (if idle? [:idle] [:timer k content])]
            [msg [:event [:info msg]]])]
     (case (first m)
       ;; the timer that woke a hibernating machine for its next timeout
-      :wake (recur parent st idle)
+      :wake (next-unsuspended parent st idle)
       :idle [m st]
       :stop [m st]
+      :system [m st]
       :event [m st]
       :timer (let [[_ k content] m
                    type (if (vector? k) [:generic-timeout (second k)] ({:event :timeout :state :state-timeout} k))]
                [[:event [type content]]
                 (-> st (update :timers dissoc k) (update :deadlines dissoc k))]))))
+
+(defn- next-event-of
+  "Wait for the next external event, or the earliest timer.  Returns
+  [event st]; a timer that fires is removed.  With idle ms and no timer
+  due sooner, [[:idle] st] when that long passes with no event."
+  [parent st idle]
+  (if (:suspended (:dbg st))
+    [(gs/system-message parent) st]
+    (next-unsuspended parent st idle)))
 
 (defn transition!
   "Handle one event: run the callback, then do what ensemble.statem says of
@@ -155,6 +167,21 @@
     (timer/send-after (max 0 (- deadline (now))) (act/self) [::wake]))
   (act/hibernate! run-loop m opts parent (dissoc st :hibernate)))
 
+(defn- status-of
+  "What sys/get-status shows of a machine."
+  [m parent st dbg]
+  (let [shown (gs/formatted m {:state (:state st) :data (:data st)})]
+    {:pid (act/self) :name (act/registered-name (act/self)) :module (type m)
+     :status (if (:suspended dbg) :suspended :running) :parent parent
+     :state (:state shown) :data (:data shown)}))
+
+(defn- system!
+  "Answer a system message; sys sees the machine's state as [state data]."
+  [m parent st from req]
+  (let [[dbg [state data]] (gs/handle-system (:dbg st) req from [(:state st) (:data st)]
+                                             #(status-of m parent st %))]
+    (assoc st :dbg dbg :state state :data data)))
+
 (defn- run-loop [m opts parent st]
   (loop [st st]
     (if-let [event (first (:queue st))]
@@ -162,15 +189,19 @@
       (let [_ (when (:hibernate st) (hibernate! m opts parent st))
             [msg st] (next-event-of parent st (:hibernate-after opts))]
         (case (first msg)
-          :stop (finish m (second msg) st msg)
+          (:stop :parent) (finish m (second msg) st msg)
           :idle (hibernate! m opts parent st)
-          (recur (transition! m opts st (second msg) :event)))))))
+          :system (let [[_ from req] msg] (recur (system! m parent st from req)))
+          (let [[type content] (second msg)
+                st (update st :dbg gs/observed [(if (vector? type) (first type) type) content])]
+            (recur (transition! m opts st (second msg) :event))))))))
 
 (defn- begin
   "Run the machine from state and data with init's actions, ack (if any)
   delivered once they are taken.  Never returns."
   [m opts parent ack state data actions]
-  (let [st {:state state :data data :postponed [] :queue [] :timers {} :deadlines {}}
+  (let [st {:state state :data data :postponed [] :queue [] :timers {} :deadlines {}
+            :dbg gs/no-debug}
         [_ _ inserted replies timeouts] (sm/actions-of actions)
         timers (sm/next-timers false {} timeouts)
         st (assoc st :queue inserted :timers timers
@@ -207,7 +238,8 @@
 (defn- start* [m {:keys [name trap timeout] :as opts} link?]
   (let [ack (promise)
         parent (when link? (act/self))
-        a (act/spawn (fn [] (run m opts parent ack)) {:name name :link link? :trap trap})]
+        a (act/spawn (fn [] (run m opts parent ack))
+                     {:name name :link link? :trap trap :initial-call [(type m) :init]})]
     (gs/await-init a ack timeout "gen-statem")))
 
 (defn start

@@ -345,6 +345,7 @@
   (swap! nodes assoc nm {:transport transport :conns {} :watching {} :exported {}
                          :node-mons [] :pending {} :spawn (:spawn opts)})
   (act/set-remote-resolver! (fn [[_ remote-nm peer]] (->RemoteName peer remote-nm)))
+  (act/set-peers-fn! (fn [] (connected (act/node))))
   (act/set-remote-alias-sender! (fn [alias msg]
                                   (send-frame! (act/node) (:ensemble.actor/owner-node alias) [:alias alias msg])))
   nm))

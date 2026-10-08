@@ -43,6 +43,7 @@
             [ensemble.life :as life]
             [ensemble.logger :as logger]
             [ensemble.process :as proc]
+            [ensemble.registry :as reg]
             [ensemble.pattern :as pattern]
             [ensemble.select :as select]
             [ensemble.signal :as sig]))
@@ -99,6 +100,20 @@
   [f]
   (reset! remote-resolver f))
 
+(defonce ^:private peers-fn
+  ;; set by ensemble.node: the nodes the current node is connected to
+  (atom (fn [] [])))
+
+(defn set-peers-fn!
+  "Install how nodes finds the current node's peers."
+  [f]
+  (reset! peers-fn f))
+
+(defn nodes
+  "The nodes the current node is connected to, as Erlang's nodes/0."
+  []
+  (vec (@peers-fn)))
+
 (defmethod print-method ::actor [x ^java.io.Writer w]
   (.write w (str "#<actor " (::pid x) ">")))
 
@@ -153,10 +168,13 @@
   (open? @(::links actor)))
 
 (defn whereis
-  "The live actor registered under nm on this node, or nil."
+  "The live actor registered under nm on this node, or nil.  nm may be a
+  name in another registry, [:via r name]."
   [nm]
-  (let [a (get-in @registry [(node) (norm-name nm)])]
-    (when (and a (alive? a)) a)))
+  (if (reg/via? nm)
+    (let [[_ r n] nm] (reg/whereis-name r n))
+    (let [a (get-in @registry [(node) (norm-name nm)])]
+      (when (and a (alive? a)) a))))
 
 (defn register!
   "Register actor under nm, so ! and whereis accept the name.  As in Erlang it
@@ -197,12 +215,15 @@
   (vec (keep (fn [[k v]] (when (alive? v) k)) (get @registry (node)))))
 
 (defn resolve-dest
-  "A process handle from a handle, a name registered on this node, or a
-  name on another, [:At name node].  Sending to a name nobody holds
-  throws, as Erlang's Name ! Msg does."
+  "A process handle from a handle, a name registered on this node, a name
+  on another, [:At name node], or a name in a registry, [:via r name].
+  Sending to a name nobody holds throws, as Erlang's Name ! Msg does."
   [dest]
   (cond
     (pid? dest) dest
+    (reg/via? dest)
+    (or (whereis dest)
+        (throw (ex-info "no process registered under name" {:reason :badarg :name dest})))
     (and (vector? dest) (= :At (first dest)))
     (if (= (nth dest 2) (node))
       (resolve-dest (second dest))
@@ -436,7 +457,11 @@
   monitor."
   [dest]
   (let [me (self)
-        obj (when-not (pid? dest) (name-object dest))
+        ;; a registry's name is looked up, as gen_server does before it
+        ;; monitors: the DOWN names the process
+        dest (if (reg/via? dest) (or (whereis dest) dest) dest)
+        obj (when-not (or (pid? dest) (reg/via? dest)) (name-object dest))
+        obj (if (reg/via? dest) dest obj)
         actor (if obj (try (resolve-dest dest) (catch Throwable _ nil)) dest)
         ;; the watcher's pid, for the target's process-info :monitored-by
         ref (assoc (make-ref) ::by (::pid me))
@@ -538,6 +563,8 @@
   (let [[links _] (swap-vals! (::links me) (constantly ::closed))
         [mons _]  (swap-vals! (::monitors me) (constantly ::closed))]
     (swap! registry update (::node me) (fn [r] (into {} (remove (fn [[_ v]] (= v me))) r)))
+    (when-let [[_ r n] (:via @(::origin me))]
+      (try (reg/unregister-name r n) (catch Throwable _ nil)))
     (doseq [[ref target] @(::monitoring me) :when (watched? target)] (proc/-drop-monitor target ref))
     (swap! procs dissoc (::pid me))
     (doseq [other links]
@@ -585,8 +612,9 @@
                  ;; a throw the body did not catch is a crash, and is reported,
                  ;; as the emulator reports an uncaught error; an exit is not
                  (when (and (not killed) (instance? Throwable reason))
-                   (logger/report! {:level :error :kind :crash-report :pid me
-                                    :name (registered-name me) :reason reason}))
+                   (logger/report! (merge {:level :error :kind :crash-report :pid me
+                                           :name (registered-name me) :reason reason}
+                                          @(::origin me))))
                  (settle! me reason)
                  (deliver (::done me)
                           (if (sig/normal? reason)
@@ -754,6 +782,8 @@
      ::refused (atom nil)
      ::fiber (atom nil)
      ::waiting (atom false)
+     ;; proc_lib's: {:initial-call x :ancestors [parent ...]}
+     ::origin (atom {})
      ::trapping (atom false)}
     {:type ::actor}))
 
@@ -762,10 +792,17 @@
   :normal when f returns, with reason when f calls (exit! reason), and with
   the throwable when f throws.  Options:
 
-      :name     register the actor under this name before it runs
+      :name     register the actor under this name before it runs; a
+                name [:via r nm] is registered with registry r instead,
+                and released there when the actor exits
       :link     link it to the current actor before it runs (spawn_link)
       :trap     start it trapping exits
       :state    the actor's initial state (see state)
+      :initial-call  what it was started to run, for process-info and
+                crash reports, as proc_lib records {M, F, A}
+
+  As proc_lib does, it records its ancestors: the spawning actor, then
+  that one's ancestors.
 
   A link or name set here is in place before the body's first step, so an
   immediate crash cannot slip past it."
@@ -774,9 +811,16 @@
    (let [parent (self)
          me (new-actor (swap! counter inc) (node))
          go (promise)]
+     (reset! (::origin me) {:initial-call (:initial-call opts)
+                            :ancestors (if parent (into [parent] (:ancestors @(::origin parent))) [])})
      (when trap (reset! (::trapping me) true))
      (reset! (::state me) (:state opts))
-     (when name (register! name me))
+     (if (reg/via? name)
+       (let [[_ r n] name]
+         (if (reg/register-name r n me)
+           (swap! (::origin me) assoc :via name)
+           (throw (ex-info "name already registered" {:reason :badarg :name name}))))
+       (when name (register! name me)))
      (swap! procs assoc (::pid me) me)
      (when (and link parent)
        (swap! (::links me) conj parent)
@@ -830,7 +874,7 @@
 
 (def ^:private info-keys
   [:registered-name :status :message-queue-len :messages :links :monitors
-   :monitored-by :trap-exit])
+   :monitored-by :trap-exit :initial-call :ancestors])
 
 (defn- info-item [actor k]
   (case k
@@ -847,6 +891,8 @@
                                  (keys ms)))
                       []))
     :trap-exit @(::trapping actor)
+    :initial-call (:initial-call @(::origin actor))
+    :ancestors (:ancestors @(::origin actor) [])
     (throw (ex-info "not a process-info item" {:reason :badarg :item k}))))
 
 (defn process-info
@@ -854,7 +900,8 @@
   :registered-name, :status (:running, :waiting in a receive, :hibernating
   or :passivated), :message-queue-len, :messages, :links, :monitors (each
   [:process p]), :monitored-by (the local actors monitoring it) and
-  :trap-exit; with k, that item alone.  nil once the actor has exited.  A
+  :trap-exit, and proc_lib's :initial-call and :ancestors; with k, that
+  item alone.  nil once the actor has exited.  A
   process on another node is a badarg, as in Erlang."
   ([actor] (process-info actor nil))
   ([actor k]
