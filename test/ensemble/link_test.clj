@@ -7,6 +7,15 @@
 
 (defn- waiter [] (act/spawn (fn [] (receive [:die (act/exit! :boom)] [:quit :ok]))))
 
+(defn- linked!
+  "Link to target, then deliver p: a test waits on p, not on a sleep, before
+  it makes target exit, or the link may find target gone and be noproc."
+  [target p]
+  (act/link! target)
+  (deliver p true))
+
+(defn- ready? [& ps] (every? #(deref % 1000 false) ps))
+
 (deftest a-normal-exit-leaves-a-linked-actor-alone
   (let [a (waiter)
         b (act/spawn (fn [] (act/link! a) (act/! a :quit) (receive [:ping :alive])))]
@@ -28,9 +37,10 @@
 
 (deftest links-cascade
   (let [a (waiter)
-        b (act/spawn (fn [] (act/link! a) (receive [_ :never])))
-        c (act/spawn (fn [] (act/link! b) (receive [_ :never])))]
-    (sleep 20)
+        lb (promise) lc (promise)
+        b (act/spawn (fn [] (linked! a lb) (receive [_ :never])))
+        c (act/spawn (fn [] (linked! b lc) (receive [_ :never])))]
+    (is (ready? lb lc))
     (act/! a :die)
     (is (= :boom (act/exit-reason b 1000)))
     (is (= :boom (act/exit-reason c 1000)))))
@@ -55,9 +65,10 @@
 
 (deftest a-trapper-stops-the-cascade
   (let [a (waiter)
-        b (act/spawn (fn [] (act/trap-exit!) (act/link! a) (receive [[:EXIT _ _] (receive [:quit :ok])])))
-        c (act/spawn (fn [] (act/link! b) (receive [:quit :ok])))]
-    (sleep 20)
+        lb (promise) lc (promise)
+        b (act/spawn (fn [] (act/trap-exit!) (linked! a lb) (receive [[:EXIT _ _] (receive [:quit :ok])])))
+        c (act/spawn (fn [] (linked! b lc) (receive [:quit :ok])))]
+    (is (ready? lb lc))
     (act/! a :die)
     (sleep 20)
     (is (act/alive? b))
@@ -80,10 +91,11 @@
 
 (deftest killed-reaches-links-as-a-trappable-reason
   (let [victim (act/spawn (fn [] (receive [_ :never])))
-        trapper (act/spawn (fn [] (act/trap-exit!) (act/link! victim)
+        lt (promise) lm (promise)
+        trapper (act/spawn (fn [] (act/trap-exit!) (linked! victim lt)
                              (receive [[:EXIT _ r] r])))
-        mortal (act/spawn (fn [] (act/link! victim) (receive [_ :never])))]
-    (sleep 20)
+        mortal (act/spawn (fn [] (linked! victim lm) (receive [_ :never])))]
+    (is (ready? lt lm))
     (act/exit! victim :kill)
     (is (= :killed (act/join trapper 1000)))
     (is (= :killed (act/exit-reason mortal 1000)))))
@@ -161,8 +173,9 @@
 
 (deftest an-actor-parked-on-its-own-channel-dies-of-a-link
   (let [b (act/spawn (fn [] (receive [_ (act/exit! :boom)])))
-        a (act/spawn (fn [] (act/link! b) (a/<!! (a/chan))))]
-    (sleep 20)
+        la (promise)
+        a (act/spawn (fn [] (linked! b la) (a/<!! (a/chan))))]
+    (is (ready? la))
     (act/! b :go)
     (is (= :boom (act/exit-reason a 2000)))))
 
