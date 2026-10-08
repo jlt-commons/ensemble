@@ -36,7 +36,7 @@
 
 (def reply! gs/reply!)
 
-(defn- now [] (System/currentTimeMillis))
+(defn- now [] (act/now-ms))
 
 (defn- arm
   "Timers as {key [deadline content]} from the pure timers {key [ms content]}

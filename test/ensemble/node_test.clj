@@ -20,8 +20,8 @@
   []
   (let [a (keyword (str (gensym "a") ".vm"))
         b (keyword (str (gensym "b") ".vm"))]
-    (node/start! a (node/loopback))
-    (node/start! b (node/loopback))
+    (node/start! a (node/loopback) {:spawn #{'ensemble.node-test}})
+    (node/start! b (node/loopback) {:spawn #{'ensemble.node-test}})
     (node/with-node a (node/connect! b))
     [a b]))
 
@@ -150,3 +150,14 @@
         (is (= 2 (deref p 3000 nil))))
       (is (= 5 (node/with-node a (gs/call! (node/with-node b (act/whereis :counter)) [:add 3]))) "a local handle works too")
       (is (= 5 (node/with-node a (gs/call! [:At :counter b] [:get])))))))
+
+(deftest a-node-spawns-only-what-it-allows
+  (let [a (keyword (str (gensym "a") ".vm"))
+        b (keyword (str (gensym "b") ".vm"))]
+    (node/start! a (node/loopback))
+    (node/start! b (node/loopback) {:spawn (fn [sym] (= sym `idle))})
+    (is (= [:not-allowed `echo]
+           (try (node/with-node a (node/spawn-on b `echo [])) (catch Throwable e (:reason (ex-data e))))))
+    (is (= [:not-allowed `echo]
+           (try (node/with-node b (node/spawn-on a `echo [])) (catch Throwable e (:reason (ex-data e))))))
+    (is (act/pid? (node/with-node a (node/spawn-on b `idle []))))))

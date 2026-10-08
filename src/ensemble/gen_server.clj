@@ -88,12 +88,14 @@
 
 (defn call!
   "Send request to the server srv (an actor or a registered name) and wait for
-  its reply, up to timeout-ms (default *call-timeout*; nil waits forever).
+  its reply, up to timeout-ms (default *call-timeout*; nil or :infinity
+  waits forever).
   Throws if the server is not running, exits before replying, or the timeout
   elapses; the ex-data :reason says which."
   ([srv request] (call! srv request *call-timeout*))
   ([srv request timeout-ms]
-   (let [target (try (act/resolve-dest srv)
+   (let [timeout-ms (act/timeout-ms timeout-ms)
+         target (try (act/resolve-dest srv)
                      (catch Throwable _ (throw (failure :noproc request))))]
      (cond
        (= target (act/self)) (throw (failure :calling-self request))
@@ -365,7 +367,8 @@
   ([srv] (stop! srv :normal nil))
   ([srv reason] (stop! srv reason nil))
   ([srv reason timeout-ms]
-   (let [target (try (act/resolve-dest srv)
+   (let [timeout-ms (act/timeout-ms timeout-ms)
+         target (try (act/resolve-dest srv)
                      (catch Throwable _ (throw (failure :noproc [:stop reason]))))
          p (promise)
          hook (act/on-exit! target (fn [r] (deliver p r)))]
