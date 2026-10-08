@@ -9,7 +9,8 @@
             [ensemble.node :as node]
             [ensemble.pg :as pg]
             [ensemble.process :as proc]
-            [ensemble.rpc :as rpc]))
+            [ensemble.rpc :as rpc]
+            [ensemble.sys :as sys]))
 
 (defn- sleep [ms] (a/<!! (a/timeout ms)))
 
@@ -268,3 +269,25 @@
                      (deliver r [during (mons)]))
                    (receive [:never nil]))))
     (is (= [(inc before) before] (deref r 2000 nil)))))
+
+(deftest a-service-catching-up-on-nodeup-does-not-reconnect-a-dropped-node
+  ;; the services hear [:nodeup b] only after the test has dropped b, as a
+  ;; slow scheduler may arrange: their sync must not bring b back
+  (let [a (fresh-node) b (fresh-node)
+        services (fn [n] (node/with-node n (into [] (keep act/whereis) [:ensemble.pg/scope :ensemble.global/registrar])))
+        held (concat (services a) (services b))
+        got (atom [])
+        w (node/with-node a (act/spawn (fn [] (node/monitor-nodes! true)
+                                         (loop [] (swap! got conj (receive [m m])) (recur)))))]
+    (is (= 4 (count held)) "pg and global run on both nodes")
+    (doseq [s held] (sys/suspend! s))
+    (sleep 20)
+    (node/with-node a (node/connect! b))
+    (is (eventually #(= [[:nodeup b]] @got)))
+    (node/with-node a (node/disconnect! b))
+    (is (eventually #(= [[:nodeup b] [:nodedown b]] @got)))
+    (doseq [s held] (sys/resume! s))
+    (sleep 200)
+    (is (= [[:nodeup b] [:nodedown b]] @got) "no sync reconnected b")
+    (is (= [] (node/with-node a (node/connected))))
+    (act/exit! w :kill)))

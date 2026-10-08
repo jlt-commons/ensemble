@@ -55,8 +55,12 @@
           (recur (into (subvec ms 0 i) (subvec ms (inc i))) (rest xs) (conj out x))))
       [ms out])))
 
-(defn- broadcast! [msg]
-  (doseq [n (act/nodes)] (gs/cast! [:At ::scope n] msg)))
+(defn- broadcast!
+  "Cast msg to the scope on every connected node; one that has gone down
+  meanwhile is not connected to again for it."
+  [msg]
+  (node/without-connecting
+    (doseq [n (act/nodes)] (gs/cast! [:At ::scope n] msg))))
 
 (defn- leave-local
   "st with pids leaving local group g, told to monitors and peers."
@@ -131,7 +135,9 @@
           :watcher (let [[g ref] more] [:noreply (update-in st [:watchers g] dissoc ref)])
           [:noreply st]))
       (and (vector? msg) (= :nodeup (first msg)))
-      (do (gs/cast! [:At ::scope (second msg)] [:sync (act/node) (into {} (filter (comp seq val)) (:local st))])
+      ;; the peer may be down again by now: the sync must not reconnect it
+      (do (node/without-connecting
+            (gs/cast! [:At ::scope (second msg)] [:sync (act/node) (into {} (filter (comp seq val)) (:local st))]))
           [:noreply st])
       (and (vector? msg) (= :nodedown (first msg)))
       [:noreply (publish! (set-remote st (second msg) {}))]

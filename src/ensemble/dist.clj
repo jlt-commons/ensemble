@@ -60,8 +60,13 @@
 ;;
 ;;   A -> B  [:name A creation]
 ;;   B -> A  [:status s], and if s is :ok, [:challenge B creation cB]
-;;   A -> B  [:reply cA (sign cB)]
-;;   B -> A  [:ack (sign cA)]
+;;   A -> B  [:reply cA (sign [cB A B])]
+;;   B -> A  [:ack (sign [cA B A])]
+;;
+;; A signature covers the challenge, the node signing and the node it is
+;; meant for.  Erlang's covers the challenge alone, which lets a node
+;; without the cookie that gets one node to dial it pass the challenge of
+;; a third along and answer that third node as the first.
 ;;
 ;; Each step takes this end's state, the frame read, and ctx: {:up-creation
 ;; f :pending? f :fresh c :sign f} -- the creation of the run of a peer
@@ -138,15 +143,15 @@
       (let [[_ nm cr c] frame]
         (if (= nm (:peer hs))
           [:Next (assoc hs :phase :ack :peer-creation cr :mine (:fresh ctx))
-           [[:reply (:fresh ctx) (sign c)]]]
+           [[:reply (:fresh ctx) (sign [c (:self hs) nm])]]]
           [:Fail [:wrong-node nm] []]))
       (and (= :reply phase) (= :reply tag))
       (let [[_ c digest] frame]
-        (if (= digest (sign (:mine hs)))
-          [:Up (assoc hs :phase :up) [[:ack (sign c)]]]
+        (if (= digest (sign [(:mine hs) (:peer hs) (:self hs)]))
+          [:Up (assoc hs :phase :up) [[:ack (sign [c (:self hs) (:peer hs)])]]]
           [:Fail :bad-cookie []]))
       (and (= :ack phase) (= :ack tag))
-      (if (= (second frame) (sign (:mine hs)))
+      (if (= (second frame) (sign [(:mine hs) (:peer hs) (:self hs)]))
         [:Up (assoc hs :phase :up) []]
         [:Fail :bad-cookie []])
       :else [:Fail [:unexpected frame] []])))
