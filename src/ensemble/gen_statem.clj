@@ -85,7 +85,7 @@
         r (if (and (vector? ret) (= ::crash (first ret))) ret (sm/result-of kind ret (:state st) (:data st)))]
     (case (first r)
       ::crash (finish m (second r) st)
-      :Bad (finish m [:bad-return-value (second r)] st)
+      :Bad (finish m (second r) st)
       :Stop (let [[_ reason replies data] r]
               (doseq [[from v] (map rest replies)] (reply! from v))
               (finish m reason (assoc st :data data)))

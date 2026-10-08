@@ -8,7 +8,8 @@
   blocks on channels), so it is exercised there rather than by a law.  Both
   run under clojure.test.
 
-  Discovery is by directory scan, so adding a spec or test file is enough."
+  Discovery is by directory scan, so adding a spec or test file is enough.
+  Namespaces given as arguments narrow the run to those."
   (:require [clojure.test :as t]
             [clojure.string :as str]
             [jolt.fs :as fs]))
@@ -42,9 +43,13 @@
    {:test 0 :pass 0 :fail 0 :error 0}
    nses))
 
-(defn -main [& _]
-  (let [specs (discovered "*_spec.clj")
-        tests (discovered "*_test.clj")
+(defn -main
+  "Run every spec and test, or only the namespaces named in args."
+  [& args]
+  (let [only (when (seq args) (set (map symbol args)))
+        pick (fn [nses] (if only (filterv only nses) nses))
+        specs (pick (discovered "*_spec.clj"))
+        tests (pick (discovered "*_test.clj"))
         {:keys [test pass fail error] :or {test 0 pass 0 fail 0 error 0}}
         (run-tests (concat specs tests))]
     (println (str "\nSpecs: " (count specs) ", tests: " (count tests) " namespaces."))

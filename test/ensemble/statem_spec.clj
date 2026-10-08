@@ -17,14 +17,21 @@
       [:stop reason]           [:stop reason d]
       [:stop-and-reply reason replies]   [:stop-and-reply reason replies d]
 
-  and anything else is a bad return value.  A state enter call may not
-  change the state, postpone, or insert events.
+  and anything else stops the machine with {bad_return_from_state_function,
+  Ret}.  A state enter call may not change the state
+  ({bad_state_enter_return_from_state_function, Ret}), postpone, or insert
+  events ({bad_state_enter_action_from_state_function, Action}).
 
-  Actions: :postpone, [:next-event type content], [:reply from value],
-  [:timeout ms content] (the event timeout), [:state-timeout ms content],
+  Actions: :postpone or [:postpone bool], [:next-event type content],
+  [:reply from value], [:timeout ms content] (the event timeout), a bare
+  time ms (short for [:timeout ms ms]), [:state-timeout ms content],
   [:generic-timeout name ms content].  A time of nil or :infinity cancels.
   :hibernate or [:hibernate bool]: hibernate before waiting for the next
-  event; of several, the last decides.
+  event; of several, the last decides.  Where a list of actions goes, one
+  action alone may go instead, as OTP's [action()] | action().  An action
+  that is none of these stops the machine with
+  {bad_action_from_state_function, Action}; a reply of stop-and-reply that
+  is not a reply, with {bad_reply_action_from_state_function, Action}.
 
   The event queue:
   - A postponed event is kept; while the state stays the same it is not
@@ -64,6 +71,7 @@
 (ann result-of [Kind Any Any Any -> Result])
 (ann actions-of [(Vec Any) -> Actions])
 (ann hibernate? [(Vec Any) -> Bool])
+(ann first-of [(Set Keyword) (List Any) -> (Opt (Vec Any))])
 (ann next-queues [Bool Bool Any (Vec Any) (Vec Any) (Vec Any) -> Queues])
 (ann next-timers [Bool (Map Any Any) (Vec Any) -> (Map Any Any)])
 
@@ -81,7 +89,9 @@
    :edges  {:ret     {[result-of Kind _ Any Any] #{:transition :stop :bad}}
             :actions {[actions-of] #{:parsed}}}
    :tested {:ret "a return's actions may be a list of any length, which needs induction"
-            :actions "an actions list of unknown length needs induction"}})
+            :actions "an actions list of unknown length needs induction"}
+   ;; a generated return is seldom a well-formed stop
+   :witnesses {[:ret :stop] [[:stop :why] :event :s :d]}})
 
 ;; --- the spec's vocabulary ----------------------------------------------
 
@@ -113,25 +123,86 @@
 (law stop-forms
   (forall [why Any, d Any]
     (and (= (result-of :event [:stop why] :s d) [:Stop why [] d])
+         (= (result-of :event [:stop-and-reply why [:reply from 1]] :s d)
+            [:Stop why [[:reply from 1]] d])
          (= (result-of :event [:stop why :d1] :s d) [:Stop why [] :d1])
          (= (result-of :event [:stop-and-reply why [[:reply from 1]]] :s d)
             [:Stop why [[:reply from 1]] d])
          (= (result-of :event [:stop-and-reply why [] :d1] :s d) [:Stop why [] :d1]))))
 
-(law anything-else-is-bad
-  (and (= (result-of :event :oops :s :d) [:Bad :oops])
-       (= (result-of :event [:next-state :s] :s :d) [:Bad [:next-state :s]])
-       (= (result-of :event [:keep-state :d :not-actions] :s :d) [:Bad [:keep-state :d :not-actions]])))
+(law anything-else-is-a-bad-return
+  (and (= (result-of :event :oops :s :d) [:Bad [:bad-return-from-state-function :oops]])
+       (= (result-of :event [:next-state :s] :s :d)
+          [:Bad [:bad-return-from-state-function [:next-state :s]]])
+       (= (result-of :event [:stop :a :b :c] :s :d)
+          [:Bad [:bad-return-from-state-function [:stop :a :b :c]]])))
+
+(law one-reply-alone-is-a-list-of-one
+  (forall [st Any, d Any, v Any]
+    (= (result-of :event [:keep-state-and-data [:reply from v]] st d)
+       [:Transition st d [[:reply from v]]])))
+
+(law one-keyword-action-alone-is-a-list-of-one
+  (forall [st Any, d Any]
+    (and (= (result-of :event [:keep-state d :postpone] st :d0) [:Transition st d [:postpone]])
+         (= (result-of :event [:keep-state-and-data [:hibernate true]] st d)
+            [:Transition st d [[:hibernate true]]]))))
+
+(law one-timeout-alone-is-a-list-of-one
+  (and (= (result-of :event [:keep-state-and-data [:state-timeout 100 :c]] :s :d)
+          [:Transition :s :d [[:state-timeout 100 :c]]])
+       (= (result-of :event [:keep-state-and-data [:timeout 0 :c]] :s :d)
+          [:Transition :s :d [[:timeout 0 :c]]])
+       (= (result-of :event [:keep-state-and-data [:generic-timeout :g :infinity :c]] :s :d)
+          [:Transition :s :d [[:generic-timeout :g :infinity :c]]])))
+
+(law one-bare-time-alone-is-a-list-of-one
+  (forall [st Any, d Any, ms Nat]
+    (= (result-of :event [:keep-state-and-data ms] st d) [:Transition st d [ms]])))
+
+(law a-bad-action-stops-the-machine
+  (forall [st Any, d Any, k Keyword]
+    (=> (not (contains? #{:postpone :hibernate :infinity} k))
+        (and (= (result-of :event [:keep-state d k] st d)
+                [:Bad [:bad-action-from-state-function k]])
+             (= (result-of :event [:next-state st d [[:reply from 1] k]] st d)
+                [:Bad [:bad-action-from-state-function k]])))))
+
+(law malformed-actions-are-bad
+  (and (= (result-of :event [:keep-state-and-data [nil]] :s :d)
+          [:Bad [:bad-action-from-state-function nil]])
+       (= (result-of :event [:keep-state-and-data [[:hibernate 1]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:hibernate 1]]])
+       (= (result-of :event [:keep-state-and-data [[:postpone true :x]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:postpone true :x]]])
+       (= (result-of :event [:keep-state-and-data [[:hibernate true :x]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:hibernate true :x]]])
+       (= (result-of :event [:keep-state-and-data [[:reply from]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:reply from]]])
+       (= (result-of :event [:keep-state-and-data [[:generic-timeout :g -1 :x]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:generic-timeout :g -1 :x]]]) (= (result-of :event [:keep-state-and-data [[:postpone :yes]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:postpone :yes]]])
+       (= (result-of :event [:keep-state-and-data [[:timeout -1 :x]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:timeout -1 :x]]])
+       (= (result-of :event [:keep-state-and-data [[:next-event :bogus 1]]] :s :d)
+          [:Bad [:bad-action-from-state-function [:next-event :bogus 1]]])))
+
+(law stop-and-reply-takes-only-replies
+  (= (result-of :event [:stop-and-reply :why [[:reply from 1] :postpone]] :s :d)
+     [:Bad [:bad-reply-action-from-state-function :postpone]]))
 
 (law an-enter-call-cannot-change-state
-  (= (result-of :enter [:next-state :other :d] :s :d) [:Bad [:next-state :other :d]]))
+  (= (result-of :enter [:next-state :other :d] :s :d)
+     [:Bad [:bad-state-enter-return-from-state-function [:next-state :other :d]]]))
 
 (law an-enter-call-may-name-its-own-state
   (= (result-of :enter [:next-state :s :d1] :s :d) [:Transition :s :d1 []]))
 
 (law an-enter-call-cannot-postpone-or-insert
-  (and (= (first (result-of :enter [:keep-state :d [:postpone]] :s :d)) :Bad)
-       (= (first (result-of :enter [:keep-state :d [[:next-event :internal 1]]] :s :d)) :Bad)))
+  (and (= (result-of :enter [:keep-state :d [:postpone]] :s :d)
+          [:Bad [:bad-state-enter-action-from-state-function :postpone]])
+       (= (result-of :enter [:keep-state :d [[:next-event :internal 1]]] :s :d)
+          [:Bad [:bad-state-enter-action-from-state-function [:next-event :internal 1]]])))
 
 ;; --- actions ------------------------------------------------------------
 
@@ -164,6 +235,15 @@
 
 (law infinity-is-a-cancel
   (= (actions-of [[:timeout :infinity :a]]) [:Actions false [] [] [[:event nil :a]]]))
+
+(law a-bare-time-is-an-event-timeout
+  (and (= (actions-of [5]) [:Actions false [] [] [[:event 5 5]]])
+       (= (actions-of [0]) [:Actions false [] [] [[:event 0 0]]])
+       (= (actions-of [:infinity]) [:Actions false [] [] [[:event nil :infinity]]])))
+
+(law postpone-may-say-whether
+  (and (= (actions-of [[:postpone true]]) [:Actions true [] [] []])
+       (= (actions-of [[:postpone false]]) [:Actions false [] [] []])))
 
 ;; --- the queue ----------------------------------------------------------
 
@@ -239,13 +319,17 @@
   {:states {:ret Any, :start Starts, :ignore Ignores, :fail Fails}
    :edges  {:ret {[init-of _] #{:start :ignore :fail}}}
    ;; a generated return is seldom :ignore or an [:ok state data]
-   :witnesses {[:ret :start] [[:ok 1 2]], [:ret :ignore] [:ignore]}})
+   :witnesses {[:ret :start] [[:ok 1 2]], [:ret :ignore] [:ignore]}
+   :tested {:ret "an init's actions may be a list of any length, which needs induction"}})
 
 (law init-ok-starts-in-the-state
   (forall [st Any, d Any] (= (init-of [:ok st d]) [:Start st d []])))
 
 (law init-ok-with-actions
-  (forall [st Any, d Any, as (Vec Any)] (= (init-of [:ok st d as]) [:Start st d as])))
+  (forall [st Any, d Any, ms Nat, v Any]
+    (and (= (init-of [:ok st d [[:state-timeout ms v] [:next-event :internal v]]])
+            [:Start st d [[:state-timeout ms v] [:next-event :internal v]]])
+         (= (init-of [:ok st d [:next-event :internal v]]) [:Start st d [[:next-event :internal v]]]))))
 
 (law init-ignore
   (= (init-of :ignore) [:Ignore]))
@@ -253,17 +337,22 @@
 (law init-error-exits-normal
   (forall [why Any] (= (init-of [:error why]) [:Fail why :normal])))
 
+(law init-error-takes-one-reason
+  (= (init-of [:error :a :b]) [:Fail [:bad-return-from-init [:error :a :b]] [:bad-return-from-init [:error :a :b]]]))
+
 (law init-stop-exits-with-its-reason
   (forall [why Any] (= (init-of [:stop why]) [:Fail why why])))
 
 (law a-bare-state-and-data-is-a-bad-init
   (forall [st Any, d Any]
     (=> (not (contains? #{:ok :stop :error} st))
-        (= (init-of [st d]) [:Fail [:bad-return-value [st d]] [:bad-return-value [st d]]]))))
+        (= (init-of [st d]) [:Fail [:bad-return-from-init [st d]] [:bad-return-from-init [st d]]]))))
 
-(law init-actions-must-be-a-list
+(law init-actions-must-be-actions
   (forall [st Any, d Any, k Keyword]
-    (= (init-of [:ok st d k]) [:Fail [:bad-return-value [:ok st d k]] [:bad-return-value [:ok st d k]]])))
+    (=> (not (contains? #{:postpone :hibernate :infinity} k))
+        (= (init-of [:ok st d k])
+           [:Fail [:bad-action-from-state-function k] [:bad-action-from-state-function k]]))))
 
 ;; --- the runtime decides through these ----------------------------------
 

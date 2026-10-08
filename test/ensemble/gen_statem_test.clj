@@ -129,7 +129,7 @@
                       (handle-event [_ _ _ _ _] :nonsense)
                       (terminate [_ _ _ _] nil)))]
     (gs/cast! m :x)
-    (is (= [:bad-return-value :nonsense] (act/exit-reason m 1000)))))
+    (is (= [:bad-return-from-state-function :nonsense] (act/exit-reason m 1000)))))
 
 (defrecord InitM [ret]
   sm/Machine
@@ -149,7 +149,7 @@
     (is (= :nope (try (sm/start (->InitM (fn [] (reset! a (act/self)) [:stop :nope])))
                       (catch Throwable e (:reason (ex-data e))))))
     (is (= :nope (act/exit-reason @a 1000))))
-  (is (= [:bad-return-value [:s nil]]
+  (is (= [:bad-return-from-init [:s nil]]
          (try (sm/start (->InitM (fn [] [:s nil]))) (catch Throwable e (:reason (ex-data e)))))))
 
 ;; --- hibernation ------------------------------------------------------------
@@ -183,3 +183,31 @@
     (is (eventually #(act/hibernating? m)))
     (is (eventually #(some #{[:asleep :state-timeout :ring]} @log)) "the state timeout fired and woke it")
     (is (= [:awake 0] (gs/call! m :where)))))
+
+;; OTP takes one action alone where a list goes, and stops a machine whose
+;; callback returns an action that is none
+(defrecord Actions []
+  sm/Machine
+  (init [_] [:ok :s nil])
+  (handle-event [_ type content _ _]
+    (case content
+      :single [:keep-state-and-data [:reply (second type) 42]]
+      :bogus [:keep-state-and-data [[:reply (second type) 1] :bogus]]
+      :junk :junk
+      [:keep-state-and-data]))
+  (terminate [_ _ _ _] nil))
+
+(deftest one-action-alone-answers-the-call
+  (let [m (sm/start (->Actions))]
+    (is (= 42 (gs/call! m :single 1000)))
+    (gs/stop! m)))
+
+(deftest a-bad-action-stops-the-machine
+  (let [m (sm/start (->Actions))]
+    (is (thrown? Exception (gs/call! m :bogus 1000)))
+    (is (= [:bad-action-from-state-function :bogus] (act/exit-reason m 1000)))))
+
+(deftest a-bad-return-stops-the-machine
+  (let [m (sm/start (->Actions))]
+    (gs/cast! m :junk)
+    (is (= [:bad-return-from-state-function :junk] (act/exit-reason m 1000)))))

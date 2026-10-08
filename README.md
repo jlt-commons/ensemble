@@ -181,7 +181,12 @@ callback, `(handle-event this type content state data)`, sees every event:
 
 Results are `:next-state`, `:keep-state`, `:keep-state-and-data`, `:stop`
 and `:stop-and-reply`. Actions are `:postpone`, `:next-event`, `:reply`,
-`:timeout`, `:state-timeout` and `:generic-timeout`. A postponed event is
+`:timeout` (or a bare time), `:state-timeout`, `:generic-timeout` and
+`:hibernate`. One action may stand alone where a list goes, as
+`[:keep-state-and-data [:reply from v]]`. A bad return stops the machine
+with `[:bad-return-from-state-function ret]`, and an action that is none
+of these with `[:bad-action-from-state-function a]`, the reasons OTP
+gives. A postponed event is
 retried after the next state change. Inserted events run before everything
 else. A state timeout is cancelled by a state change, and the event timeout
 by any event. `{:state-enter true}` turns on enter calls. Clients use
