@@ -7,12 +7,23 @@
       {:name          keyword, unique
        :start         (fn [] top-supervisor) or (fn [] [top-supervisor state])
        :stop          (fn [state])          run after the tree has stopped
+       :prep-stop     (fn [state] state')   run before the tree stops; :stop
+                                            gets what it returns
        :applications  [name ...]            must be running first
+       :optional-applications [name ...]    of those, the ones that may be
+                                            absent: one not loaded is skipped
+       :included-applications [name ...]    started by this one's own tree,
+                                            never by the controller
+       :env           {key value}           its configuration (get-env)
+       :start-phases  [[phase args] ...]    run in order after :start, each
+                                            as (start-phase phase :normal args)
+       :start-phase   (fn [phase type args]) -> :ok
        :type          :temporary | :transient | :permanent    (:temporary)}
 
   start! runs :start and has an application master monitor the tree it
-  returns.  stop! stops the tree (as a supervisor stops: children in reverse
-  order) and then runs :stop.  If the tree exits by itself the application
+  returns, then runs the start phases; one that does not answer :ok stops
+  the tree and fails the start.  stop! runs :prep-stop, stops the tree (as
+  a supervisor stops: children in reverse order) and then runs :stop.  If the tree exits by itself the application
   has stopped, and its type decides the rest, as OTP's does: a :temporary
   application is only reported; a :permanent one, or a :transient one that
   exited abnormally, takes every other running application down with it --
@@ -27,17 +38,64 @@
 
 (defonce ^:private exit-log (atom []))
 
+(defonce ^:private envs
+  ;; name -> {key value}: each application's configuration
+  (atom {}))
+
 (defonce ^:private started-order
   ;; the names of the running applications, in the order they started
   (atom []))
 
 (defn load!
-  "Register an application spec.  Returns its name."
+  "Register an application spec.  Its :env is the application's
+  configuration, under any value set-env! has given a key already.
+  Returns its name."
   [spec]
   (swap! loaded assoc (:name spec) spec)
+  (swap! envs update (:name spec) #(merge (:env spec) %))
   (:name spec))
 
+(defn get-key
+  "The value of key k in the loaded spec of application name."
+  [name k]
+  (get-in @loaded [name k]))
+
+(defn get-env
+  "Application name's configuration value for k, or default (nil)."
+  ([name k] (get-env name k nil))
+  ([name k default] (get-in @envs [name k] default)))
+
+(defn get-all-env
+  "Application name's whole configuration, a map."
+  [name]
+  (get @envs name {}))
+
+(defn set-env!
+  "Set application name's configuration value for k.  Returns :ok."
+  [name k v]
+  (swap! envs assoc-in [name k] v)
+  :ok)
+
+(defn unset-env!
+  "Remove k from application name's configuration.  Returns :ok."
+  [name k]
+  (swap! envs update name dissoc k)
+  :ok)
+
 (defn- fail [reason] (throw (ex-info (str "application: " (pr-str reason)) {:reason reason})))
+
+(defn- required
+  "The dependencies of spec that must run first: its :applications,
+  less the optional ones that are not loaded."
+  [spec]
+  (let [optional (set (:optional-applications spec))]
+    (remove #(and (contains? optional %) (not (contains? @loaded %))) (:applications spec))))
+
+(defn- includer
+  "The running application that includes name, or nil."
+  [name]
+  (some (fn [[n a]] (when (and (map? a) (some #{name} (:included-applications (:spec a)))) n))
+        @running))
 
 (declare stop-all!)
 
@@ -59,13 +117,28 @@
              (stop-all!)))]
         [::stop (act/demonitor! ref {:flush true})])))))
 
+(declare stop!)
+
+(defn- run-phases!
+  "Run spec's start phases in order; throws for the first that does not
+  answer :ok."
+  [spec]
+  (doseq [[phase args] (:start-phases spec)]
+    (let [r ((:start-phase spec) phase :normal args)]
+      (when-not (= :ok r) (fail [:bad-start-phase phase r])))))
+
 (defn start!
-  "Start the loaded application name.  Its :applications must be running.
-  Throws if it is already running, not loaded, a dependency is not running,
-  or its :start throws.  Returns :ok."
+  "Start the loaded application name.  Its :applications must be running,
+  less any optional one that is not loaded, and its included applications
+  loaded.  Throws if it is already running, not loaded, included by a
+  running application, a dependency is not running, or its :start or a
+  start phase fails.  Returns :ok."
   [name]
   (let [spec (or (get @loaded name) (fail [:not-loaded name]))]
-    (doseq [dep (:applications spec)]
+    (when-let [by (includer name)] (fail [:included name by]))
+    (doseq [inc (:included-applications spec)]
+      (when-not (contains? @loaded inc) (fail [:not-loaded inc])))
+    (doseq [dep (required spec)]
       (when-not (contains? @running dep) (fail [:not-started dep])))
     ;; claim the name first, so two starts of one application cannot both run
     (let [[before _] (swap-vals! running (fn [r] (if (contains? r name) r (assoc r name ::starting))))]
@@ -78,37 +151,53 @@
       (swap! started-order (fn [o] (conj (filterv #(not= name %) o) name)))
       (swap! running assoc name {:spec spec :top top :state state
                                  :master (master name top (:type spec :temporary))})
+      (try (run-phases! spec)
+           (catch Throwable e (stop! name) (throw e)))
       :ok)))
 
 (defn ensure-all-started!
   "Start name and, first, every application it depends on, transitively,
-  that is not already running.  Returns the names started, in order."
+  that is not already running.  Returns the names started, in order.  If
+  one fails to start, those it started are stopped again, the last first,
+  and it throws, as OTP 26's does."
   [name]
   ;; depth first: an application goes after everything it depends on
   (let [ordered (loop [todo [name], out [], steps 0]
                   (if-let [n (first todo)]
                     (let [spec (or (get @loaded n) (fail [:not-loaded n]))
-                          deps (remove (set out) (:applications spec))]
+                          deps (remove (set out) (required spec))]
                       (when (> steps 10000) (fail [:circular-dependencies name]))
                       (if (seq deps)
                         (recur (concat deps todo) out (inc steps))
                         (recur (rest todo) (if (some #{n} out) out (conj out n)) (inc steps))))
                     out))]
-    (vec (for [n ordered :when (not (contains? @running n))]
-           (do (start! n) n)))))
+    (loop [todo (remove #(contains? @running %) ordered), started []]
+      (if-let [n (first todo)]
+        (do (try (start! n)
+                 (catch Throwable e
+                   (doseq [s (rseq started)] (stop! s))
+                   (throw e)))
+            (recur (rest todo) (conj started n)))
+        started))))
 
 (defn stop!
-  "Stop the running application name: stop its tree, then run :stop on its
-  state.  Returns :ok, or nil if it is not running."
+  "Stop the running application name: run :prep-stop on its state, stop
+  its tree, then run :stop on what :prep-stop returned.  Returns :ok, or
+  nil if it is not running."
   [name]
-  (when-let [{:keys [spec top state master]} (let [a (get @running name)] (when (map? a) a))]
-    (swap! running dissoc name)
-    (swap! started-order (fn [o] (filterv #(not= name %) o)))
-    (act/! master ::stop)
-    (when (act/alive? top)
-      (try (gs/stop! top :shutdown) (catch Throwable _ (act/exit! top :kill))))
-    (when-let [stop (:stop spec)] (stop state))
-    :ok))
+  ;; claimed first, so of two stops only one runs the callbacks
+  (let [[before _] (swap-vals! running (fn [r] (if (map? (get r name)) (dissoc r name) r)))
+        a (get before name)]
+    (when (map? a)
+      (let [{:keys [spec top state master]} a]
+        (swap! started-order (fn [o] (filterv #(not= name %) o)))
+        ;; the master stops watching, so the tree's exit is not a crash
+        (act/! master ::stop)
+        (let [state (if-let [prep (:prep-stop spec)] (prep state) state)]
+          (when (act/alive? top)
+            (try (gs/stop! top :shutdown) (catch Throwable _ (act/exit! top :kill))))
+          (when-let [stop (:stop spec)] (stop state))
+          :ok)))))
 
 (defn- stop-all!
   "Stop every running application, the last started first, as OTP stops
