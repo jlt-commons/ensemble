@@ -35,9 +35,12 @@
 
 (deftest a-hibernating-process-keeps-its-name-links-and-monitors
   (let [watcher (promise)
+        linked (promise)
         p (act/spawn #(act/hibernate! counter 0) {:name :sleepy})]
-    (act/spawn (fn [] (act/trap-exit!) (act/link! p)
+    (act/spawn (fn [] (act/trap-exit!) (act/link! p) (deliver linked true)
                  (deliver watcher (receive [[:EXIT _ r] r] [:after 2000 :none]))))
+    ;; linked before p stops, or the link finds it gone: :noproc
+    (is (deref linked 1000 false))
     (is (eventually #(act/hibernating? p)))
     (is (= p (act/whereis :sleepy)))
     (act/! :sleepy :stop)
