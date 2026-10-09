@@ -28,7 +28,7 @@
       (let [r (first (of-kind rs :crash-report))]
         (is (= :error (:level r)))
         (is (= a (:pid r)))
-        (is (= :crasher (:name r)))
+        (is (= ::crasher (:name r)))
         (is (= e (:reason r)))))))
 
 (deftest a-normal-or-requested-exit-is-not-a-crash

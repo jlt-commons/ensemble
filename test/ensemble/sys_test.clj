@@ -57,7 +57,7 @@
   (let [s (gs/start (->Counter) {:name ::counted})
         st (sys/get-status s)]
     (is (= s (:pid st)))
-    (is (= :counted (:name st)))
+    (is (= ::counted (:name st)))
     (is (= :running (:status st)))
     (is (= {:n 0 :secret "pw"} (:state st)))
     (gs/stop! s)))

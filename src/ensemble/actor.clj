@@ -162,12 +162,14 @@
 (defonce ^:private registry (atom {}))
 
 (defn- norm-name
-  "A registry key from a name: a keyword, symbol or string, all normalised to
-  the same key."
+  "A registry key from a name: a keyword, symbol or string with the same text
+  is the same key, a keyword.  The namespace is kept, so :a/b, 'a/b and
+  \"a/b\" are one name and :a/b and :c/b are two."
   [nm]
-  (if (or (string? nm) (keyword? nm) (symbol? nm))
-    (keyword (clojure.core/name nm))
-    (throw (ex-info "a name is a keyword, symbol or string" {:reason :badarg :name nm}))))
+  (cond
+    (string? nm) (keyword nm)
+    (or (keyword? nm) (symbol? nm)) (keyword (namespace nm) (clojure.core/name nm))
+    :else (throw (ex-info "a name is a keyword, symbol or string" {:reason :badarg :name nm}))))
 
 (defn- open?
   "Links and monitors are an open collection until the actor exits, then
@@ -215,7 +217,7 @@
     actor))
 
 (defn registered-name
-  "The name actor is registered under, or nil."
+  "The name actor is registered under, as a keyword, or nil."
   [actor]
   (some (fn [[k v]] (when (= v actor) k)) (get @registry (::node actor))))
 

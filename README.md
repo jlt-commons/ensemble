@@ -493,7 +493,9 @@ The layers, bottom up:
   a timer instead).
 - **Reasons** are any value, and a crash's reason is the throwable itself
   rather than `{Exception, Stacktrace}`.
-- **Names** may be keywords, symbols or strings, all normalised to a keyword.
+- **Names** may be keywords, symbols or strings, all normalised to a keyword
+  that keeps the namespace: `:a/b`, `'a/b` and `"a/b"` are one name, `:a/b`
+  and `:c/b` are two.
 
 ## Contracts
 

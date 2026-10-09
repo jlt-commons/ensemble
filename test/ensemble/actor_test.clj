@@ -188,6 +188,34 @@
     (is (= a (act/whereis 'svc-2)))
     (act/! a :go)))
 
+(deftest namespaced-names-normalise
+  (testing "a keyword, symbol and string with the same text are one name"
+    (let [a (act/spawn (fn [] (receive [_ :ok])) {:name "nsa/svc"})]
+      (is (= a (act/whereis :nsa/svc)))
+      (is (= a (act/whereis 'nsa/svc)))
+      (is (= a (act/whereis "nsa/svc")))
+      (is (= :nsa/svc (act/registered-name a)))
+      (is (some #{:nsa/svc} (act/registered)))
+      (act/unregister! 'nsa/svc)
+      (is (nil? (act/whereis :nsa/svc)))
+      (act/! a :go))))
+
+(deftest names-differing-only-by-namespace-are-distinct
+  (let [a (act/spawn (fn [] (receive [_ :ok])) {:name :nsb/svc})
+        b (act/spawn (fn [] (receive [_ :ok])) {:name :nsc/svc})]
+    (is (= a (act/whereis :nsb/svc)))
+    (is (= b (act/whereis :nsc/svc)))
+    (is (nil? (act/whereis :svc)))
+    (is (= :nsb/svc (act/registered-name a)))
+    (is (= :nsc/svc (act/registered-name b)))
+    (act/! a :go) (act/! b :go)))
+
+(deftest an-unqualified-name-is-registered-as-a-plain-keyword
+  (let [a (act/spawn (fn [] (receive [_ :ok])) {:name 'svc-plain})]
+    (is (= :svc-plain (act/registered-name a)))
+    (is (= a (act/whereis "svc-plain")))
+    (act/! a :go)))
+
 (deftest a-taken-name-cannot-be-registered-again
   (let [a (act/spawn (fn [] (receive [_ :ok])) {:name :svc-3})
         b (act/spawn (fn [] (receive [_ :ok])))]
@@ -356,7 +384,7 @@
   (let [a (act/spawn (fn [] (let [r (act/monitor! ::nobody)]
                               (receive [[:DOWN r :process obj reason] [obj reason]]
                                        [:after 1000 :no-down]))))]
-    (is (= [[:At :nobody (act/node)] :noproc] (act/join a 2000)))))
+    (is (= [[:At ::nobody (act/node)] :noproc] (act/join a 2000)))))
 
 (deftest a-monitor-by-name-reports-the-name
   (let [t (act/spawn (fn [] (receive [:die (act/exit! :bye)])) {:name ::watched})
@@ -364,7 +392,7 @@
                               (act/! t :die)
                               (receive [[:DOWN r :process obj reason] [obj reason]]
                                        [:after 1000 :no-down]))))]
-    (is (= [[:At :watched (act/node)] :bye] (act/join a 2000)))))
+    (is (= [[:At ::watched (act/node)] :bye] (act/join a 2000)))))
 
 ;; --- refs carry their node --------------------------------------------------
 
@@ -387,7 +415,7 @@
     (is (eventually #(= :waiting (act/process-info a :status))))
     (is (= 2 (act/process-info a :message-queue-len)))
     (is (= [:x [:y 1]] (act/process-info a :messages)))
-    (is (= :info-box (act/process-info a :registered-name)))
+    (is (= ::info-box (act/process-info a :registered-name)))
     (is (false? (act/process-info a :trap-exit)))
     (act/! a :go)
     (act/! a :stop)
