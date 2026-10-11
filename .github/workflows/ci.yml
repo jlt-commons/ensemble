@@ -6,15 +6,15 @@ on:
   workflow_dispatch:
     inputs:
       jolt-version:
-        description: "jolt version to install (blank = nightly)"
+        description: "jolt version to install (blank = v0.8.21; 'nightly' for main)"
         required: false
         default: ""
 
-# jolt's rolling nightly build of main: ensemble follows the runtime it needs
-# (jolt.fibers/kill!) as it lands, ahead of a release.  The dispatch input
-# overrides it for one run, to try a particular release
+# the first jolt release with what ensemble needs: fiber kills
+# (jolt.fibers/kill!) and fiber pools (jolt.fibers/pool).  The dispatch input
+# overrides it for one run, to try the nightly or another release
 env:
-  JOLT_VERSION: ${{ inputs.jolt-version || 'nightly' }}
+  JOLT_VERSION: ${{ inputs.jolt-version || 'v0.8.21' }}
 
 jobs:
   test:

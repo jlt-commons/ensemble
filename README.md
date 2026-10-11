@@ -16,10 +16,9 @@ Not published yet, so point at the git repo:
          :git/sha "PUT-A-SHA-HERE"}}}
 ```
 
-It needs a jolt with fiber kills (`jolt.fibers/kill!`), which no `catch`
-can stop, and fiber pools (`jolt.fibers/pool`) for dispatchers: the
-nightly build (`install --version nightly`) until a release after 0.8.20
-has them. CI runs against the nightly.
+It needs jolt 0.8.21 or later, for fiber kills (`jolt.fibers/kill!`),
+which no `catch` can stop, and fiber pools (`jolt.fibers/pool`) for
+dispatchers. CI runs against 0.8.21.
 
 ## Processes
 
