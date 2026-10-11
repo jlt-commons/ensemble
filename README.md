@@ -8,12 +8,12 @@ remote pids) is not part of this first pass.
 
 ## Depend on it
 
-Not published yet, so point at the git repo:
+As a git dependency:
 
 ```clojure
 {:deps {io.github.jlt-commons/ensemble
         {:git/url "https://github.com/jlt-commons/ensemble"
-         :git/sha "PUT-A-SHA-HERE"}}}
+         :git/tag "v0.1.0" :git/sha "0037a1c"}}}
 ```
 
 It needs jolt 0.8.21 or later, for fiber kills (`jolt.fibers/kill!`),
