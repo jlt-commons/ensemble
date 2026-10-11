@@ -246,19 +246,21 @@
      (when (= :Fail (first as)) (act/exit! (second as)))
      (begin m opts (:parent opts) nil state data (nth as 3)))))
 
-(defn- start* [m {:keys [name trap timeout] :as opts} link?]
+(defn- start* [m {:keys [name trap timeout dispatcher] :as opts} link?]
   (let [ack (promise)
         parent (when link? (act/self))
         a (act/spawn (fn [] (run m opts parent ack))
-                     {:name name :link link? :trap trap :initial-call [(type m) :init]})]
+                     {:name name :link link? :trap trap :dispatcher dispatcher
+                      :initial-call [(type m) :init]})]
     (gs/await-init a ack timeout "gen-statem")))
 
 (defn start
   "Start machine m, returning once init has returned.  Options: :name,
   :trap (trap exits, so a supervisor's shutdown runs terminate),
   :state-enter (make enter calls), :timeout (ms init may take, default
-  :infinity; a slower init is killed and start throws {:reason :timeout})
-  and :hibernate-after (hibernate after that many ms with no event)."
+  :infinity; a slower init is killed and start throws {:reason :timeout}),
+  :hibernate-after (hibernate after that many ms with no event) and
+  :dispatcher (the dispatcher to run it on, see ensemble.dispatcher)."
   ([m] (start m {}))
   ([m opts] (start* m opts false)))
 

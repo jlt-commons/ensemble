@@ -473,14 +473,15 @@
                       {:reason (second r)}
                       (when (instance? Throwable (second r)) (second r)))))))
 
-(defn- start* [server {:keys [name timeout trap hibernate-after passivate-after]} link?]
+(defn- start* [server {:keys [name timeout trap hibernate-after passivate-after dispatcher]} link?]
   (let [ack (promise)
         parent (when link? (act/self))
         srv (try
               (act/spawn (fn [] (run server parent ack
                                      (cond passivate-after {:after passivate-after :disk? true}
                                            hibernate-after {:after hibernate-after :disk? false})))
-                         {:name name :link link? :trap trap :initial-call [(type server) :init]})
+                         {:name name :link link? :trap trap :dispatcher dispatcher
+                          :initial-call [(type server) :init]})
               (catch Throwable e
                 (if-let [holder (and name (act/whereis name))]
                   (throw (ex-info "gen-server already started"
@@ -501,7 +502,8 @@
                 cleanly when its parent stops it traps exits)
       :hibernate-after  hibernate after this many ms with no message, as
                 OTP's hibernate_after
-      :passivate-after  the same, to disk (see ensemble.actor/passivate!)"
+      :passivate-after  the same, to disk (see ensemble.actor/passivate!)
+      :dispatcher  the dispatcher to run it on (see ensemble.dispatcher)"
   ([server] (start server {}))
   ([server opts] (start* server opts false)))
 
