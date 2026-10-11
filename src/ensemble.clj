@@ -7,6 +7,7 @@
   modules, since they share names such as start and start-link:
 
       ensemble.actor        processes: spawn, !, receive, links, monitors
+      ensemble.dispatcher   the pools of carriers actors run on
       ensemble.gen-server   gen_server
       ensemble.gen-statem   gen_statem
       ensemble.gen-event    gen_event

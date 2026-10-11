@@ -40,6 +40,7 @@
             [jolt.fibers :as fib]
             [jolt.fs :as fs]
             [jolt.image :as image]
+            [ensemble.dispatcher :as dispatcher]
             [ensemble.life :as life]
             [ensemble.logger :as logger]
             [ensemble.process :as proc]
@@ -599,12 +600,15 @@
 
 (declare park!)
 
+(declare run-on!)
+
 (defn- run-fiber!
-  "Run (body) as actor me on a new fiber.  When it hibernates, me parks;
-  otherwise me has exited, and settles: its links and monitors are told,
-  and join sees how."
+  "Run (body) as actor me on a new fiber, on its dispatcher.  When it
+  hibernates, me parks; otherwise me has exited, and settles: its links and
+  monitors are told, and join sees how."
   [me body]
-  (fib/spawn
+  (run-on!
+   me
    (fn []
      (binding [*actor* me]
        ;; the body runs interruptible; what follows it -- telling the
@@ -640,6 +644,18 @@
                           (if (sig/normal? reason)
                             [:ok (:ok r)]
                             [:err (or (:err r) (exit-ex reason)) reason])))))))))))
+
+(defn- run-on!
+  "Spawn the fiber f on me's dispatcher's pool.  One shut down since -- a
+  hibernating actor waking after it went -- leaves me on :default."
+  [me f]
+  (let [[d p] @(::dispatcher me)]
+    (if (nil? p)
+      (fib/spawn f)
+      (try (fib/spawn f {:pool p})
+           (catch Throwable _
+             (reset! (::dispatcher me) [:default nil])
+             (fib/spawn f))))))
 
 (def ^:dynamic *image-dir*
   "Where a passivated process's image is written."
@@ -801,6 +817,9 @@
      ::resume (atom nil)
      ::refused (atom nil)
      ::fiber (atom nil)
+     ;; [name pool]: the dispatcher it runs on, and that dispatcher's pool
+     ;; (nil for :default)
+     ::dispatcher (atom [:default nil])
      ::waiting (atom false)
      ;; proc_lib's: {:initial-call x :ancestors [parent ...]}
      ::origin (atom {})
@@ -820,6 +839,9 @@
       :state    the actor's initial state (see state)
       :initial-call  what it was started to run, for process-info and
                 crash reports, as proc_lib records {M, F, A}
+      :dispatcher  the dispatcher to run it on (ensemble.dispatcher), by
+                name; :default unless given.  Its children do not inherit
+                it.  An unknown one is a badarg, and nothing is spawned
 
   As proc_lib does, it records its ancestors: the spawning actor, then
   that one's ancestors.
@@ -828,9 +850,12 @@
   immediate crash cannot slip past it."
   ([f] (spawn f {}))
   ([f {:keys [name link trap] :as opts}]
-   (let [parent (self)
+   (let [d (or (:dispatcher opts) :default)
+         pool (dispatcher/pool d)
+         parent (self)
          me (new-actor (swap! counter inc) (node))
          go (promise)]
+     (reset! (::dispatcher me) [d pool])
      (reset! (::origin me) {:initial-call (:initial-call opts)
                             :ancestors (if parent (into [parent] (:ancestors @(::origin parent))) [])})
      (when trap (reset! (::trapping me) true))
@@ -902,7 +927,7 @@
 
 (def ^:private info-keys
   [:registered-name :status :message-queue-len :messages :links :monitors
-   :monitored-by :trap-exit :initial-call :ancestors])
+   :monitored-by :trap-exit :initial-call :ancestors :dispatcher])
 
 (defn- info-item [actor k]
   (case k
@@ -921,15 +946,16 @@
     :trap-exit @(::trapping actor)
     :initial-call (:initial-call @(::origin actor))
     :ancestors (:ancestors @(::origin actor) [])
+    :dispatcher (first @(::dispatcher actor))
     (throw (ex-info "not a process-info item" {:reason :badarg :item k}))))
 
 (defn process-info
   "What is known of a live local actor, as Erlang's process_info: a map of
   :registered-name, :status (:running, :waiting in a receive, :hibernating
   or :passivated), :message-queue-len, :messages, :links, :monitors (each
-  [:process p]), :monitored-by (the local actors monitoring it) and
-  :trap-exit, and proc_lib's :initial-call and :ancestors; with k, that
-  item alone.  nil once the actor has exited.  A
+  [:process p]), :monitored-by (the local actors monitoring it),
+  :trap-exit, proc_lib's :initial-call and :ancestors, and the :dispatcher
+  it runs on; with k, that item alone.  nil once the actor has exited.  A
   process on another node is a badarg, as in Erlang."
   ([actor] (process-info actor nil))
   ([actor k]

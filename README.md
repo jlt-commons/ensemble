@@ -17,8 +17,9 @@ Not published yet, so point at the git repo:
 ```
 
 It needs a jolt with fiber kills (`jolt.fibers/kill!`), which no `catch`
-can stop: the nightly build (`install --version nightly`) until a release
-after 0.8.19 has them. CI runs against the nightly.
+can stop, and fiber pools (`jolt.fibers/pool`) for dispatchers: the
+nightly build (`install --version nightly`) until a release after 0.8.20
+has them. CI runs against the nightly.
 
 ## Processes
 
@@ -32,7 +33,8 @@ after 0.8.19 has them. CI runs against the nightly.
 `spawn` runs a fn on a fiber and returns the actor. `!` never blocks; a
 message to a dead actor is dropped, and a message to an unregistered name
 throws, as `Name ! Msg` does. `spawn` takes `:name`, `:link` (spawn_link),
-`:trap` and `:state`; `spawn-link` and `spawn-monitor` are the OTP shapes.
+`:trap`, `:state` and `:dispatcher` (below); `spawn-link` and
+`spawn-monitor` are the OTP shapes.
 
 `(act/hibernate! f & args)` is `erlang:hibernate/3`. The process gives up
 its fiber and call stack, but stays alive with its pid, name, links,
@@ -120,11 +122,43 @@ Inside any actor, `(act/state)`, `(act/set-state! v)` and
 - `process-info` gives a local actor's registered name, status
   (`:running`, `:waiting`, `:hibernating`, `:passivated`), message queue
   and its length, links, monitors, monitored-by, trap-exit flag, initial
-  call and ancestors; `processes` lists the node's live actors. On a pid of
+  call, ancestors and dispatcher; `processes` lists the node's live actors. On a pid of
   another node, `process-info` and `alive?` are a badarg, as in Erlang.
 
 `join` and `exit-reason` wait for an actor from outside the actor world,
 such as a test or the REPL.
+
+### Dispatchers
+
+An actor runs on a fiber, and a fiber stays on its carrier (an OS thread)
+for life. A receive, a channel op, a deref or a sleep parks the fiber and
+frees the carrier. A blocking foreign call, such as a C database driver,
+doesn't, so every actor on that carrier waits with it. A long computation
+gets preempted, but it still takes its share of the carrier from the
+actors next to it. As in Akka, a dispatcher keeps that kind of work on
+carriers of its own:
+
+```clojure
+(require '[ensemble.dispatcher :as disp])
+
+(disp/define! :db {:size 8})
+
+(act/spawn query-loop {:dispatcher :db})
+(gs/start (->Repo) {:dispatcher :db})
+```
+
+`:default` is jolt's carrier pool, with one carrier per processor, and it
+is what every actor runs on unless told otherwise. `:blocking` has 16
+carriers for blocking calls, like Akka's `default-blocking-io-dispatcher`.
+A dispatcher's carriers start the first time an actor is spawned on it,
+and until then it can be redefined, so `:blocking` can be resized at
+startup. Children don't inherit their parent's dispatcher.
+gen_server, gen_statem and gen_event take `:dispatcher` as a start option;
+under a supervisor, pass it in the child's start fn. Messages, links,
+monitors and exit signals work across dispatchers as they do within one.
+`(disp/shutdown! name)` stops new spawns on a dispatcher, and its carriers
+end once the actors already on them have exited. A hibernating actor whose
+dispatcher was shut down wakes on `:default`.
 
 ## gen_server
 
@@ -491,6 +525,8 @@ The layers, bottom up:
   Erlang nodes. global and pg have the default scope only.
 - There is no hot code loading, and no reductions (jolt preempts fibers on
   a timer instead).
+- **Dispatchers** come from Akka; Erlang has a single scheduler pool, plus
+  dirty schedulers for NIFs.
 - **Reasons** are any value, and a crash's reason is the throwable itself
   rather than `{Exception, Stacktrace}`.
 - **Names** may be keywords, symbols or strings, all normalised to a keyword
