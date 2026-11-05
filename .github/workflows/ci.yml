@@ -14,7 +14,7 @@ on:
 # (jolt.fibers/kill!) and fiber pools (jolt.fibers/pool).  The dispatch input
 # overrides it for one run, to try the nightly or another release
 env:
-  JOLT_VERSION: ${{ inputs.jolt-version || 'v0.8.21' }}
+  JOLT_VERSION: ${{ inputs.jolt-version || 'v0.8.24' }}
 
 jobs:
   test:
