@@ -3,8 +3,9 @@
 Erlang processes and the OTP behaviours for [jolt](https://github.com/jolt-lang/jolt),
 on jolt's native fibers. The goal is Erlang's semantics: links, exit signals,
 monitors, selective receive, gen_server, gen_statem, gen_event, supervisors
-and applications behave as the Erlang/OTP docs describe. Distribution (nodes,
-remote pids) is not part of this first pass.
+and applications behave as the Erlang/OTP docs describe. Distribution covers
+nodes, remote pids, rpc, global and pg; it ships a loopback transport only
+(see [Distribution](#distribution)).
 
 ## Depend on it
 
