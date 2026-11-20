@@ -53,7 +53,7 @@
 
 (def ^:dynamic *node*
   "The node code outside any actor runs as; an actor runs as its own."
-  :nonode@nohost)
+  (keyword "nonode@nohost"))
 
 (defn self
   "The actor this code is running as, or nil outside an actor."
